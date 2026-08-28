@@ -1,3 +1,8 @@
+> **In the wild** — [RAG Converter](https://ragconverter.com) uses `rusty_flac` to decode the audio.
+> It makes personal and work files AI-readable without them leaving the machine:
+> the whole conversion runs as WebAssembly in the browser tab, with nothing
+> uploaded and nothing to install.
+
 # rusty_flac
 
 [![crates.io](https://img.shields.io/crates/v/rusty_flac?logo=rust)](https://crates.io/crates/rusty_flac)
