@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.1.2...v0.1.3) - 2026-08-29
+
+### Other
+
+- an In the wild block above the headline ([#6](https://github.com/Remade-With-Rust/rusty_flac/pull/6))
+
 ## [0.1.2](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.1.1...v0.1.2) - 2026-08-28
 
 ### Other
