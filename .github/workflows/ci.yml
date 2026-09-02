@@ -27,6 +27,27 @@ jobs:
       # depth x channels x level, own decoder + claxon oracle) runs here.
       - name: Test (release)
         run: cargo test --release
+      # The same gates with the pure-Rust libm doing the encoder's math: this
+      # is the configuration a chip runs, so its streams must pass the
+      # lossless + claxon oracle too.
+      - name: Test (release, libm math)
+        run: cargo test --release --features libm
+
+  no_std:
+    name: no_std (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - riscv32imac-unknown-none-elf # ESP32-C6 class
+          - thumbv7em-none-eabihf # Cortex-M4F/M7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo check --no-default-features --features libm --target ${{ matrix.target }}
 
   lint:
     runs-on: ubuntu-latest

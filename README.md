@@ -13,7 +13,8 @@
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
 
 > **rusty_flac** is a ground-up, pure-**Rust** FLAC **encoder and decoder**:
-> zero dependencies, no C, no FFI. It **encodes 17% faster and decodes 23%
+> no required dependencies, no C, no FFI, `no_std` + `alloc` ready. It
+> **encodes 17% faster and decodes 23%
 > faster than FFmpeg** while producing **smaller files on every benchmarked
 > content class** — and every stream is verified **losslessly interoperable in
 > both directions** (FFmpeg decodes ours bit-exact; we decode FFmpeg's
@@ -46,7 +47,7 @@ compression at the same time**, without giving up a byte of interoperability:
   round-trips bit-exact: FFmpeg decodes our streams to the exact source PCM,
   and we decode FFmpeg's streams to the exact source PCM. STREAMINFO carries
   the spec's MD5 signature, so `flac -t` verifies our output too.
-- **Zero dependencies.** No C, no FFI, no external crates — the bit I/O, CRCs,
+- **No required dependencies.** No C, no FFI — the bit I/O, CRCs,
   MD5, LPC analysis, Rice coding and all four stereo modes are in this crate.
   `unsafe` exists only inside four AVX2 kernels (autocorrelation, Rice
   parameter sums, fixed-order estimation, LPC residual), each runtime-detected
@@ -56,7 +57,7 @@ compression at the same time**, without giving up a byte of interoperability:
 | | FFmpeg flac (C) | **rusty_flac (Rust)** |
 |---|---|---|
 | C/C++ in the dependency tree | all of it | **none** |
-| Dependencies | libavcodec/libavutil | **zero** |
+| Dependencies | libavcodec/libavutil | **none required** (optional pure-Rust `libm` for `no_std`) |
 | Encode CPU (level 8) | 1.00× | **0.83× — 17.3% faster** |
 | Decode CPU | 1.00× | **0.77× — 22.7% faster** |
 | Output size, 20-combo gate matrix | baseline | **smaller on 20/20** |
@@ -110,8 +111,9 @@ directions: FIXED and LPC prediction (orders to 12), all four stereo modes
 (independent, left/side, right/side, mid/side), **wasted-bits** detection,
 Rice and **Rice2** partitioned residuals with escape codes, 8/16/24-bit encode
 and 4–32-bit decode, up to 8 channels, CRC-8/CRC-16 verification, and the
-STREAMINFO MD5 audio signature. There is no C in the dependency tree — in
-fact there are **no dependencies at all**. It is a reimplementation of the
+STREAMINFO MD5 audio signature. There is no C in the dependency tree — the
+only dependency is optional and pure Rust (`libm`, for `no_std` builds). It
+is a reimplementation of the
 format, not a wrapper, and it is Apache-2.0: embed it in closed-source
 software with no copyleft obligations.
 
@@ -190,7 +192,8 @@ clip, in-house and reference-encoded):
 
 **Shared:**
 
-- **Zero dependencies, no C, no FFI.** Bit I/O, CRC-8/16, MD5 — all in-crate.
+- **No required dependencies, no C, no FFI.** Bit I/O, CRC-8/16, MD5 — all
+  in-crate. `no_std` + `alloc` with the optional pure-Rust `libm`.
 - **`unsafe` is confined to four AVX2 kernels**, each runtime-detected
   (`is_x86_feature_detected!`), each with a scalar twin kept as oracle and
   fallback, each gated **bit-identical** by a dedicated test. Integer kernels
@@ -300,10 +303,28 @@ CPU-time harness that produced the N = 31 speed verdicts lives alongside it.
 | Windows | ✅ builds + tests |
 | Linux | ✅ builds + tests |
 | macOS | ✅ builds + tests |
+| `no_std` + `alloc` (`--no-default-features --features libm`) | ✅ checked on `riscv32imac-unknown-none-elf` and `thumbv7em-none-eabihf` in CI |
 
 The AVX2 kernels are runtime-detected — no build flags, no `nasm`, no ISA
 floor. On any CPU without AVX2 (or any non-x86 target) the scalar twins run
 and produce the same bytes.
+
+### `no_std`
+
+```toml
+[dependencies]
+rusty_flac = { version = "0.1", default-features = false, features = ["libm"] }
+```
+
+The crate needs an allocator (`alloc`) — the encoder buffers the stream it is
+building — and nothing else. Without `std` there is no per-thread scratch
+reuse (each analysis allocates its scratch), no runtime AVX2 detection and no
+`RUSTY_FLAC_TIMING`. The `libm` feature is what makes an encoder on a chip
+and an encoder on a host produce the **same bytes** for the same samples: it
+routes the encoder's few transcendentals (window design, LPC quantisation,
+the Rice estimate) through the deterministic pure-Rust `libm` instead of the
+platform's. Build the host side with `--features libm` too when you want
+that bit-identity.
 
 ## Roadmap
 
@@ -331,7 +352,7 @@ and produce the same bytes.
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). No GPL/LGPL anywhere in the dependency
-tree — there is no dependency tree.
+tree — the only (optional) dependency, `libm`, is MIT OR Apache-2.0.
 
 ## About Mata Network
 
