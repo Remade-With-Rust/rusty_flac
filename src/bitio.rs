@@ -4,6 +4,8 @@
 //! `write_bits(v, n)` costs O(bytes emitted), not O(n) single-bit steps.
 //! The reader mirrors it: a 64-bit window refilled 4 bytes at a time.
 
+use alloc::vec::Vec;
+
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------

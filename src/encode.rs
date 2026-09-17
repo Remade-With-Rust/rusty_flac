@@ -11,8 +11,39 @@
 //! The encoder buffers the whole stream and emits a complete native FLAC
 //! stream from [`Encoder::finish`] — framing, STREAMINFO and MD5 included.
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::bitio::BitWriter;
 use crate::crc::{crc16, crc8};
+use crate::math;
+
+/// A reusable scratch `Vec`: per thread under `std` (one allocation per
+/// thread for the life of the process), a fresh allocation per call without
+/// it. The body sees `$v: &mut Vec<$t>` either way.
+macro_rules! with_scratch {
+    ($name:ident : $t:ty, |$v:ident| $body:expr) => {{
+        #[cfg(feature = "std")]
+        {
+            thread_local! {
+                static $name: core::cell::RefCell<Vec<$t>> =
+                    const { core::cell::RefCell::new(Vec::new()) };
+            }
+            $name.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let $v: &mut Vec<$t> = &mut guard;
+                $body
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let mut owned: Vec<$t> = Vec::new();
+            let $v: &mut Vec<$t> = &mut owned;
+            $body
+        }
+    }};
+}
 
 /// Nominal samples-per-channel per FLAC frame. 4096 is FLAC's usual default and
 /// encodes as an explicit 16-bit block size (frame-header block-size code 7).
@@ -48,8 +79,8 @@ pub enum EncodeError {
     RaggedInput,
 }
 
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             EncodeError::TooManyChannels(c) => write!(f, "flac: {c} channels (max 8)"),
             EncodeError::NoChannels => write!(f, "flac: zero channels"),
@@ -62,7 +93,7 @@ impl std::fmt::Display for EncodeError {
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl core::error::Error for EncodeError {}
 
 /// Wiring-audit counters: every decision path in the encoder counts what it
 /// chose, so a corpus run can prove no path is silently dead and no fallback
@@ -209,7 +240,7 @@ impl Encoder {
         }
         let quant = |c: &[u8]| -> i32 {
             let s = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            (s * scale).round().clamp(-scale, scale - 1.0) as i32
+            math::roundf(s * scale).clamp(-scale, scale - 1.0) as i32
         };
         match ch {
             1 => self.chans[0].extend(bytes.chunks_exact(4).map(quant)),
@@ -254,7 +285,7 @@ impl Encoder {
     /// Like [`Encoder::finish`], but also returns the wiring-audit counters.
     pub fn finish_with_stats(mut self) -> (Vec<u8>, EncodeStats) {
         let out = self.encode_stream();
-        let stats = std::mem::take(&mut self.stats);
+        let stats = core::mem::take(&mut self.stats);
         (out, stats)
     }
 
@@ -313,7 +344,9 @@ impl Encoder {
     fn encode_stream(&mut self) -> Vec<u8> {
         // RUSTY_FLAC_TIMING=1: print coarse stage shares to stderr (wiring
         // audit / campaign tool; zero cost when unset).
+        #[cfg(feature = "std")]
         let timing = std::env::var_os("RUSTY_FLAC_TIMING").is_some();
+        #[cfg(feature = "std")]
         let t0 = std::time::Instant::now();
         let n = self.chans.first().map_or(0, |c| c.len());
         let bps = self.bps;
@@ -341,7 +374,9 @@ impl Encoder {
             max_fs = 0;
         }
 
+        #[cfg(feature = "std")]
         let t_frames = t0.elapsed();
+        #[cfg(feature = "std")]
         let t1 = std::time::Instant::now();
 
         // STREAMINFO (34 bytes). Block sizes are the NOMINAL blocking (the
@@ -360,6 +395,7 @@ impl Encoder {
             si.write_bits(byte as u64, 8);
         }
         let si = si.into_bytes();
+        #[cfg(feature = "std")]
         if timing {
             eprintln!(
                 "rusty_flac timing: frames {:.1} ms, md5+streaminfo {:.1} ms",
@@ -408,7 +444,7 @@ impl Encoder {
                 (assignment, subs)
             } else {
                 let max_lpc_order = self.max_lpc_order;
-                let chans = std::mem::take(&mut self.chans);
+                let chans = core::mem::take(&mut self.chans);
                 let subs = (0..self.channels)
                     .map(|c| {
                         let arm = ArmInput::prepare(&chans[c][start..start + bs], bps);
@@ -485,10 +521,10 @@ fn tukey_window(n: usize, alpha: f64) -> Vec<f64> {
     for (i, wi) in w.iter_mut().enumerate() {
         let x = i as f64 / (n - 1) as f64;
         if x < alpha / 2.0 {
-            *wi = 0.5 * (1.0 + (std::f64::consts::PI * (2.0 * x / alpha - 1.0)).cos());
+            *wi = 0.5 * (1.0 + math::cos(core::f64::consts::PI * (2.0 * x / alpha - 1.0)));
         } else if x > 1.0 - alpha / 2.0 {
-            *wi =
-                0.5 * (1.0 + (std::f64::consts::PI * (2.0 * x / alpha - 2.0 / alpha + 1.0)).cos());
+            *wi = 0.5
+                * (1.0 + math::cos(core::f64::consts::PI * (2.0 * x / alpha - 2.0 / alpha + 1.0)));
         }
     }
     w
@@ -551,7 +587,7 @@ fn zigzag(v: i32) -> u32 {
 /// is exact (gated by `rice_sums_avx2_matches_scalar`).
 #[inline]
 fn rice_sums(res: &[i32]) -> [u64; RICE_KMAX + 1] {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: guarded by the runtime AVX2 check.
@@ -572,10 +608,10 @@ fn rice_sums_scalar(res: &[i32]) -> [u64; RICE_KMAX + 1] {
     sums
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx2")]
 unsafe fn rice_sums_avx2(res: &[i32]) -> [u64; RICE_KMAX + 1] {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     // 16 u64 accumulator lanes for k 0..15; k 16..=30 is folded from lane 15
     // afterwards by re-scanning IF any residual is big enough to need it
     // (rare outside high-entropy 24-bit content), so the common path stays 4
@@ -694,13 +730,8 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize) -> ResidualPlan {
     let finest_parts = 1usize << max_po;
     let finest_size = bs >> max_po;
 
-    thread_local! {
-        // Partition-sum scratch, reused across every plan on this thread.
-        static SUMS: std::cell::RefCell<Vec<[u64; RICE_KMAX + 1]>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
-    SUMS.with(|cell| {
-        let mut sums = cell.borrow_mut();
+    // Partition-sum scratch, reused across every plan on this thread.
+    with_scratch!(SUMS: [u64; RICE_KMAX + 1], |sums| {
         sums.clear();
         sums.reserve(finest_parts);
         let mut idx = 0usize;
@@ -816,26 +847,22 @@ fn write_partitioned_residual(
 /// kernel, so the two are bit-identical and the kernel is gated by direct
 /// comparison (`autocorr_avx2_matches_scalar`).
 fn autocorrelation(samples: &[i32], max_order: usize, win: &[f64]) -> Vec<f64> {
-    thread_local! {
-        // Windowed-product scratch, reused across every subframe analysis on
-        // this thread (a fresh Vec per call was ~8 × 32 KB allocations per
-        // block).
-        static W_SCRATCH: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    W_SCRATCH.with(|cell| {
-        let mut w = cell.borrow_mut();
+    // Windowed-product scratch, reused across every subframe analysis on
+    // this thread (a fresh Vec per call was ~8 × 32 KB allocations per
+    // block); without `std` it is that fresh Vec.
+    with_scratch!(W_SCRATCH: f64, |w| {
         w.clear();
         w.extend(samples.iter().zip(win).map(|(&s, &g)| s as f64 * g));
         let mut autoc = vec![0.0f64; max_order + 1];
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", feature = "std"))]
         {
             if std::arch::is_x86_feature_detected!("avx2") {
                 // SAFETY: guarded by the runtime AVX2 check.
-                unsafe { autocorr_avx2(&w, &mut autoc) };
+                unsafe { autocorr_avx2(w, &mut autoc) };
                 return autoc;
             }
         }
-        autocorr_scalar(&w, &mut autoc);
+        autocorr_scalar(w, &mut autoc);
         autoc
     })
 }
@@ -862,10 +889,10 @@ fn autocorr_scalar(w: &[f64], autoc: &mut [f64]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx2")]
 unsafe fn autocorr_avx2(w: &[f64], autoc: &mut [f64]) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let n = w.len();
     let p = w.as_ptr();
     for (lag, a) in autoc.iter_mut().enumerate() {
@@ -960,16 +987,16 @@ fn quantize_lpc(lpc: &[f64], precision: u32) -> Option<(Vec<i32>, i32)> {
     if !cmax.is_finite() || cmax <= 0.0 {
         return None;
     }
-    let exp = cmax.log2().floor() as i32 + 1; // frexp exponent of cmax
+    let exp = math::floor(math::log2(cmax)) as i32 + 1; // frexp exponent of cmax
     let shift = (precision as i32 - exp - 1).clamp(0, 15);
     let qmax = (1i32 << (precision - 1)) - 1;
     let qmin = -(1i32 << (precision - 1));
-    let scale = (shift as f64).exp2();
+    let scale = math::exp2(shift as f64);
     let mut error = 0.0f64;
     let mut qlp = Vec::with_capacity(lpc.len());
     for &c in lpc {
         let v = c * scale + error;
-        let q = v.round().clamp(qmin as f64, qmax as f64);
+        let q = math::round(v).clamp(qmin as f64, qmax as f64);
         error = v - q;
         qlp.push(q as i32);
     }
@@ -988,7 +1015,7 @@ fn quantize_lpc(lpc: &[f64], precision: u32) -> Option<(Vec<i32>, i32)> {
 /// FMA ordering cannot change a bit, and `floor(sum · 2^-shift)` equals the
 /// arithmetic shift (gated by `lpc_residual_avx2_matches_scalar`).
 fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize) -> Vec<i32> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         // Exactness guard: the vector path converts the prediction to i32
         // with saturation, while the scalar/decoder truncate — identical only
@@ -1008,17 +1035,17 @@ fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize) -> Vec<i
     lpc_residual_scalar(samples, qlp, shift, order)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn lpc_residual_avx2(samples: &[i32], qlp: &[i32], shift: i32, order: usize) -> Vec<i32> {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let n = samples.len();
     let mut res: Vec<i32> = Vec::with_capacity(n - order);
     let mut coeffs = [0.0f64; 32];
     for j in 0..order {
         coeffs[j] = qlp[j] as f64;
     }
-    let scale = _mm256_set1_pd((-(shift as f64)).exp2()); // 2^-shift, exact
+    let scale = _mm256_set1_pd(math::exp2(-(shift as f64))); // 2^-shift, exact
     let p = samples.as_ptr();
     let mut i = order;
     while i + 4 <= n {
@@ -1184,7 +1211,7 @@ fn lpc_estimate(
         let order = idx + 1;
         let var = err / n as f64;
         let bits_per = if var > 0.0 {
-            (0.5 * var.log2()).max(0.0)
+            (0.5 * math::log2(var)).max(0.0)
         } else {
             0.0
         };
@@ -1242,14 +1269,14 @@ fn realize_lpc(
 fn fixed_order_estimate(samples: &[i32]) -> (usize, u64) {
     let n = samples.len();
     let max_order = 4.min(n.saturating_sub(1));
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     let sums = if n >= 16 && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: guarded by the runtime AVX2 check.
         unsafe { fixed_sums_avx2(samples) }
     } else {
         fixed_sums_scalar(samples)
     };
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
     let sums = fixed_sums_scalar(samples);
 
     let mut best = 0usize;
@@ -1293,10 +1320,10 @@ fn fixed_sums_scalar(samples: &[i32]) -> [u64; 5] {
 /// 8-lane i32 differences (nested first-differences give every order), then
 /// abs + widening u64 accumulation. Bounded: |sample| < 2^25 (24-bit + side),
 /// order-4 coefficient sum 16 ⇒ every intermediate fits i32.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx2")]
 unsafe fn fixed_sums_avx2(samples: &[i32]) -> [u64; 5] {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let n = samples.len();
     debug_assert!(n >= 16);
 
@@ -1485,7 +1512,7 @@ struct ArmEstimate {
 /// One arm's analysis input: samples with any wasted bits already shifted
 /// out, the effective bit depth, and the wasted count for the header.
 struct ArmInput<'a> {
-    samples: std::borrow::Cow<'a, [i32]>,
+    samples: alloc::borrow::Cow<'a, [i32]>,
     /// Effective coded depth: nominal bps − wasted.
     ebps: u32,
     wasted: u32,
@@ -1497,13 +1524,13 @@ impl<'a> ArmInput<'a> {
         let wasted = detect_wasted(samples, bps);
         if wasted == 0 {
             ArmInput {
-                samples: std::borrow::Cow::Borrowed(samples),
+                samples: alloc::borrow::Cow::Borrowed(samples),
                 ebps: bps,
                 wasted: 0,
             }
         } else {
             ArmInput {
-                samples: std::borrow::Cow::Owned(samples.iter().map(|&v| v >> wasted).collect()),
+                samples: alloc::borrow::Cow::Owned(samples.iter().map(|&v| v >> wasted).collect()),
                 ebps: bps - wasted,
                 wasted,
             }
@@ -1825,10 +1852,10 @@ fn decide_stereo(
     let [a, b] = mode_arms[mode];
     let mut arms = arms;
     let mut take_arm = |arm: usize, choices: &mut [Option<SubframeChoice>; 4]| {
-        let input = std::mem::replace(
+        let input = core::mem::replace(
             &mut arms[arm],
             ArmInput {
-                samples: std::borrow::Cow::Borrowed(&[]),
+                samples: alloc::borrow::Cow::Borrowed(&[]),
                 ebps: 0,
                 wasted: 0,
             },
@@ -1944,7 +1971,7 @@ mod tests {
     /// The AVX2 autocorrelation must match the scalar twin bit-for-bit
     /// (identical striping and reduction order — no FMA, no reassociation).
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     fn autocorr_avx2_matches_scalar() {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
@@ -2015,7 +2042,7 @@ mod tests {
     /// The AVX2 shifted-sum kernel is integer math — it must match the scalar
     /// twin EXACTLY on every length (including the empty/short tails).
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     fn rice_sums_avx2_matches_scalar() {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
@@ -2039,7 +2066,7 @@ mod tests {
     /// The AVX2 fixed-order |residual| sums are integer math — exact match
     /// against the scalar twin on every length and alignment.
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     fn fixed_sums_avx2_matches_scalar() {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
@@ -2065,7 +2092,7 @@ mod tests {
     /// realistic magnitudes (the dispatcher's range guard keeps it off the
     /// degenerate ones).
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     fn lpc_residual_avx2_matches_scalar() {
         if !(std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("fma"))

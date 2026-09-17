@@ -172,6 +172,8 @@ impl Md5 {
 #[cfg(test)]
 mod tests {
     use super::Md5;
+    use alloc::format;
+    use alloc::string::String;
 
     fn hex(bytes: [u8; 16]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
