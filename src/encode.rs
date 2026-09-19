@@ -746,13 +746,29 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize) -> ResidualPlan {
         }
 
         // Cost one level from `sums[..n_part]`, both methods (method 0 pays
-        // 4 bits/param but caps k at 14; Rice2 pays 5 for k up to 30).
-        let cost_level = |sums: &[[u64; RICE_KMAX + 1]], po: u32| -> (u32, Vec<u32>, u64) {
+        // 4 bits/param but caps k at 14; Rice2 pays 5 for k up to 30). The two
+        // per-parameter buffers are reused across every level (cleared, not
+        // reallocated) — a fresh pair per level was ~2 × (max_po + 1)
+        // allocations per plan, the dominant no_std alloc count.
+        let mut ks0: Vec<u32> = Vec::with_capacity(finest_parts);
+        let mut ks1: Vec<u32> = Vec::with_capacity(finest_parts);
+
+        // Evaluate from the finest level down, merging pairs in place. Taking
+        // ties with `<=` while descending reproduces the ascending strict-<
+        // search's lowest-po-wins-ties rule. The winning parameters are copied
+        // into `best_ks` (one reused buffer) only when a level improves.
+        let mut best_method = 0u32;
+        let mut best_po = 0u32;
+        let mut best_ks: Vec<u32> = Vec::new();
+        let mut best_bits = u64::MAX;
+        let mut po = max_po;
+        loop {
+            let n_part = 1usize << po;
             let psize = bs >> po;
-            let mut ks0 = Vec::with_capacity(sums.len());
-            let mut ks1 = Vec::with_capacity(sums.len());
+            ks0.clear();
+            ks1.clear();
             let (mut bits0, mut bits1) = (0u64, 0u64);
-            for (part, s) in sums.iter().enumerate() {
+            for (part, s) in sums[..n_part].iter().enumerate() {
                 let cnt = if part == 0 { psize - p } else { psize } as u64;
                 let (k1, kb1) = best_k_from_sums(s, cnt, RICE_KMAX);
                 let (k0, kb0) = if k1 as usize <= RICE_KMAX_M0 {
@@ -765,33 +781,13 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize) -> ResidualPlan {
                 bits0 += 4 + kb0;
                 bits1 += 5 + kb1;
             }
-            if bits1 < bits0 {
-                (1, ks1, bits1)
-            } else {
-                (0, ks0, bits0)
-            }
-        };
-
-        // Evaluate from the finest level down, merging pairs in place. Taking
-        // ties with `<=` while descending reproduces the ascending strict-<
-        // search's lowest-po-wins-ties rule.
-        let mut best = ResidualPlan {
-            method: 0,
-            partition_order: 0,
-            ks: Vec::new(),
-            bits: u64::MAX,
-        };
-        let mut po = max_po;
-        loop {
-            let n_part = 1usize << po;
-            let (method, ks, bits) = cost_level(&sums[..n_part], po);
-            if bits <= best.bits {
-                best = ResidualPlan {
-                    method,
-                    partition_order: po,
-                    ks,
-                    bits,
-                };
+            let (method, bits) = if bits1 < bits0 { (1, bits1) } else { (0, bits0) };
+            if bits <= best_bits {
+                best_method = method;
+                best_po = po;
+                best_bits = bits;
+                best_ks.clear();
+                best_ks.extend_from_slice(if method == 1 { &ks1 } else { &ks0 });
             }
             if po == 0 {
                 break;
@@ -809,7 +805,12 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize) -> ResidualPlan {
             }
             po -= 1;
         }
-        best
+        ResidualPlan {
+            method: best_method,
+            partition_order: best_po,
+            ks: best_ks,
+            bits: best_bits,
+        }
     })
 }
 
