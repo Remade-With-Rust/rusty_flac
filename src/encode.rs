@@ -298,7 +298,11 @@ impl Encoder {
         let mut md5 = crate::md5::Md5::new();
         // Batch: build interleaved LE rows for a run of frames, hash per chunk.
         const CHUNK_FRAMES: usize = 16 * 1024;
-        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_FRAMES * ch * bytes_per);
+        // Reserve for the first (often only) chunk, not the full CHUNK_FRAMES:
+        // a short block used a 32 KiB transient here where 1 KiB sufficed —
+        // material on a small no_std heap. resize() still grows it for a long
+        // stream, so the per-chunk hashing is unchanged.
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_FRAMES.min(n) * ch * bytes_per);
         let mut i = 0usize;
         while i < n {
             let end = (i + CHUNK_FRAMES).min(n);
