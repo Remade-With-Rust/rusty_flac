@@ -113,6 +113,10 @@ struct EncodeScratch {
     wprod: Vec<f64>,
     /// `autocorrelation` output, lags `0..=max_order`.
     autoc: Vec<f64>,
+    /// `plan_partitions` per-level Rice parameters for the two coding methods
+    /// (transient within a plan; the winner is copied out).
+    ks0: Vec<u32>,
+    ks1: Vec<u32>,
 }
 
 /// A pure-Rust FLAC encoder. Feed planar or interleaved `i32` samples at the
@@ -736,10 +740,12 @@ fn plan_partitions(
     let finest_parts = 1usize << max_po;
     let finest_size = bs >> max_po;
 
-    // Partition-sum scratch, owned by the encoder and reused across every plan
-    // for its life. This was a fresh `Vec` per call on the no_std path (no
-    // thread-local) — the largest single analysis allocation.
-    let sums = &mut scratch.sums;
+    // Partition-sum scratch and the two per-level Rice-parameter buffers are
+    // all encoder-owned and reused across every plan for the encoder's life.
+    // The sums were a fresh `Vec` per call on the no_std path (no
+    // thread-local) — the largest single analysis allocation — and ks0/ks1
+    // were a fresh pair per plan. Disjoint fields, so borrowed together.
+    let EncodeScratch { sums, ks0, ks1, .. } = scratch;
     {
         sums.clear();
         sums.reserve(finest_parts);
@@ -758,9 +764,12 @@ fn plan_partitions(
         // 4 bits/param but caps k at 14; Rice2 pays 5 for k up to 30). The two
         // per-parameter buffers are reused across every level (cleared, not
         // reallocated) — a fresh pair per level was ~2 × (max_po + 1)
-        // allocations per plan, the dominant no_std alloc count.
-        let mut ks0: Vec<u32> = Vec::with_capacity(finest_parts);
-        let mut ks1: Vec<u32> = Vec::with_capacity(finest_parts);
+        // allocations per plan, the dominant no_std alloc count. Reserve up
+        // front so the first fill does not grow them incrementally.
+        ks0.clear();
+        ks0.reserve(finest_parts);
+        ks1.clear();
+        ks1.reserve(finest_parts);
 
         // Evaluate from the finest level down, merging pairs in place. Taking
         // ties with `<=` while descending reproduces the ascending strict-<
