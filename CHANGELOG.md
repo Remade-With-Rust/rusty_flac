@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.1.3...v0.1.4) - 2026-09-19
+
+### Other
+
+- *(encode)* reuse one frame BitWriter across the whole stream
+- *(encode)* reserve the window-estimate Vec for every window
+- *(encode)* borrow subframe samples instead of cloning them
+- *(encode)* reuse the Rice-parameter buffers across plans too
+- *(encode)* move the phase-1 window estimates into realize_arm
+- *(encode)* reuse the autocorrelation buffers; drop the scratch macro
+- *(encode)* own the partition-sum scratch on the encoder, reuse it
+- *(encode)* size the MD5 chunk buffer to the block, not to CHUNK_FRAMES
+- *(encode)* reuse Rice-parameter buffers across partition levels
+
 ## [0.1.3](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.1.2...v0.1.3) - 2026-09-17
 
 ### Added
