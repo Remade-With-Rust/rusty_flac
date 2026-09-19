@@ -11,6 +11,7 @@
 //! The encoder buffers the whole stream and emits a complete native FLAC
 //! stream from [`Encoder::finish`] — framing, STREAMINFO and MD5 included.
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -427,7 +428,15 @@ impl Encoder {
     ) -> Vec<u8> {
         // Decide the channel layout: stereo picks the cheapest decorrelation
         // mode; mono / multichannel code each channel independently.
-        let (assignment, subframes): (u64, Vec<(Vec<i32>, u32, SubframeChoice)>) =
+        //
+        // Mono/multichannel borrow each subframe's samples straight out of
+        // `self.chans` instead of copying them: the channel buffers are taken
+        // into `held_chans` for the duration of the frame (so the borrows are
+        // of a local, disjoint from `self.stats`/`self.scratch`) and restored
+        // after the frame is written. Stereo's mid and side are computed, so
+        // those subframes stay owned (`Cow::Owned`).
+        let mut held_chans: Vec<Vec<i32>> = Vec::new();
+        let (assignment, subframes): (u64, Vec<(Cow<[i32]>, u32, SubframeChoice)>) =
             if self.channels == 2 {
                 let (assignment, subs) = decide_stereo(
                     &self.chans[0][start..start + bs],
@@ -447,19 +456,19 @@ impl Encoder {
                 (assignment, subs)
             } else {
                 let max_lpc_order = self.max_lpc_order;
-                let chans = core::mem::take(&mut self.chans);
+                held_chans = core::mem::take(&mut self.chans);
+                let chans = &held_chans;
                 let stats = &mut self.stats;
                 let scratch = &mut self.scratch;
-                let subs = (0..self.channels)
+                let subs = (0..chans.len())
                     .map(|c| {
                         let arm = ArmInput::prepare(&chans[c][start..start + bs], bps);
                         let choice = analyze_subframe(&arm, max_lpc_order, wins, stats, scratch);
                         let ebps = arm.ebps;
-                        (arm.into_samples(), ebps, choice)
+                        (arm.into_cow(), ebps, choice)
                     })
                     .collect();
-                self.chans = chans;
-                ((self.channels as u64) - 1, subs)
+                ((chans.len() as u64) - 1, subs)
             };
 
         let mut bw = BitWriter::with_capacity(bs * self.channels * (bps as usize) / 8 / 2 + 64);
@@ -486,7 +495,13 @@ impl Encoder {
         bw.align_to_byte();
         let fcrc = crc16(bw.bytes());
         bw.write_bits(fcrc as u64, 16);
-        bw.into_bytes()
+        let out = bw.into_bytes();
+        // The subframes (and their borrow of held_chans) are written; restore
+        // the channel buffers taken by the mono/multichannel path.
+        if !held_chans.is_empty() {
+            self.chans = held_chans;
+        }
+        out
     }
 }
 
@@ -1566,6 +1581,13 @@ impl<'a> ArmInput<'a> {
     fn into_samples(self) -> Vec<i32> {
         self.samples.into_owned()
     }
+
+    /// Hand back the samples without materializing them: a borrow stays a
+    /// borrow (no copy) and an owned shift moves out. The caller must keep the
+    /// borrowed source alive until the subframe is written.
+    fn into_cow(self) -> Cow<'a, [i32]> {
+        self.samples
+    }
 }
 
 fn estimate_arm(
@@ -1806,7 +1828,7 @@ const STEREO_EST_MARGIN_PCT: u64 = 1;
 /// autocorrelations + Levinson + fixed-order sums); only the arms belonging
 /// to estimate-competitive modes are REALIZED (residuals, exact Rice plans).
 /// The final mode decision uses exact realized costs.
-fn decide_stereo(
+fn decide_stereo<'a>(
     l: &[i32],
     r: &[i32],
     bps: u32,
@@ -1814,7 +1836,7 @@ fn decide_stereo(
     wins: &WindowCache,
     stats: &mut EncodeStats,
     scratch: &mut EncodeScratch,
-) -> (u64, Vec<(Vec<i32>, u32, SubframeChoice)>) {
+) -> (u64, Vec<(Cow<'a, [i32]>, u32, SubframeChoice)>) {
     let side: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| a - b).collect();
     let mid: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| (a + b) >> 1).collect();
 
@@ -1895,7 +1917,7 @@ fn decide_stereo(
         );
         let ebps = input.ebps;
         let choice = choices[arm].take().expect("chosen arm realized");
-        (input.into_samples(), ebps, choice)
+        (Cow::Owned(input.into_samples()), ebps, choice)
     };
     let first = take_arm(a, &mut choices);
     let second = take_arm(b, &mut choices);
