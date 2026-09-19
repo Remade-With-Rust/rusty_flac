@@ -1519,6 +1519,7 @@ enum SubframeKind {
 /// for every window, the fixed-order estimate — everything short of residual
 /// realization. `est_bits` is the arm's estimated subframe cost, used for
 /// stereo-mode gating before any expensive realization happens.
+#[derive(Default)]
 struct ArmEstimate {
     constant: Option<i32>,
     ests: Vec<Option<LpcEstimate>>,
@@ -1616,7 +1617,7 @@ fn estimate_arm(
 /// The remaining windows' estimates (deferred by phase 1) are computed here.
 fn realize_arm(
     arm: &ArmInput<'_>,
-    est: &ArmEstimate,
+    est: ArmEstimate,
     max_lpc_order: usize,
     wins: &WindowCache,
     stats: &mut EncodeStats,
@@ -1636,9 +1637,11 @@ fn realize_arm(
         };
     }
 
-    // Complete the window-estimate set (phase 1 only did window 0).
+    // Complete the window-estimate set (phase 1 only did window 0). Take the
+    // phase-1 estimates by value (they are no longer needed by the caller) so
+    // the window-0 estimate and its coefficients are not re-cloned here.
     let max_order = max_lpc_order.min(n / 2);
-    let mut all_ests: Vec<Option<LpcEstimate>> = est.ests.clone();
+    let mut all_ests: Vec<Option<LpcEstimate>> = est.ests;
     if max_order >= 1 {
         for win in wins.w.iter().skip(all_ests.len()) {
             all_ests.push(lpc_estimate(samples, bps, max_order, win, stats, &mut *scratch));
@@ -1779,7 +1782,7 @@ fn analyze_subframe(
     scratch: &mut EncodeScratch,
 ) -> SubframeChoice {
     let est = estimate_arm(arm, max_lpc_order, wins, stats, &mut *scratch);
-    realize_arm(arm, &est, max_lpc_order, wins, stats, scratch)
+    realize_arm(arm, est, max_lpc_order, wins, stats, scratch)
 }
 
 /// Stereo modes whose estimated cost is within this relative margin of the
@@ -1813,7 +1816,7 @@ fn decide_stereo(
         ArmInput::prepare(&mid, bps),
         ArmInput::prepare(&side, bps + 1),
     ];
-    let ests = [
+    let mut ests = [
         estimate_arm(&arms[0], max_lpc_order, wins, stats, &mut *scratch),
         estimate_arm(&arms[1], max_lpc_order, wins, stats, &mut *scratch),
         estimate_arm(&arms[2], max_lpc_order, wins, stats, &mut *scratch),
@@ -1839,7 +1842,7 @@ fn decide_stereo(
             if choices[arm].is_none() {
                 choices[arm] = Some(realize_arm(
                     &arms[arm],
-                    &ests[arm],
+                    core::mem::take(&mut ests[arm]),
                     max_lpc_order,
                     wins,
                     stats,
