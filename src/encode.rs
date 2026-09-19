@@ -123,6 +123,19 @@ pub struct EncodeStats {
     pub sub_wasted_bits: u64,
 }
 
+/// Reusable analysis buffers owned by the encoder: the hot per-subframe
+/// scratch is allocated once and reused for the encoder's life instead of
+/// once per call. On `std` this is what the former thread-local pools did; on
+/// `no_std` (no thread-locals) it is the only reuse mechanism, and it is what
+/// makes a per-block encode on a small heap affordable. Cleared, never
+/// truncated in a way that changes an output byte.
+#[derive(Default)]
+struct EncodeScratch {
+    /// `plan_partitions` finest-partition Rice sums (the largest single
+    /// analysis allocation — one `[u64; RICE_KMAX+1]` per finest partition).
+    sums: Vec<[u64; RICE_KMAX + 1]>,
+}
+
 /// A pure-Rust FLAC encoder. Feed planar or interleaved `i32` samples at the
 /// configured bit depth, then [`Encoder::finish`] returns the complete stream.
 pub struct Encoder {
@@ -132,6 +145,7 @@ pub struct Encoder {
     max_lpc_order: usize,
     chans: Vec<Vec<i32>>,
     stats: EncodeStats,
+    scratch: EncodeScratch,
 }
 
 impl Encoder {
@@ -155,6 +169,7 @@ impl Encoder {
             max_lpc_order: LPC_MAX_ORDER,
             chans: vec![Vec::new(); channels as usize],
             stats: EncodeStats::default(),
+            scratch: EncodeScratch::default(),
         })
     }
 
@@ -438,6 +453,7 @@ impl Encoder {
                     self.max_lpc_order,
                     wins,
                     &mut self.stats,
+                    &mut self.scratch,
                 );
                 match assignment {
                     1 => self.stats.stereo_independent += 1,
@@ -449,10 +465,12 @@ impl Encoder {
             } else {
                 let max_lpc_order = self.max_lpc_order;
                 let chans = core::mem::take(&mut self.chans);
+                let stats = &mut self.stats;
+                let scratch = &mut self.scratch;
                 let subs = (0..self.channels)
                     .map(|c| {
                         let arm = ArmInput::prepare(&chans[c][start..start + bs], bps);
-                        let choice = analyze_subframe(&arm, max_lpc_order, wins, &mut self.stats);
+                        let choice = analyze_subframe(&arm, max_lpc_order, wins, stats, scratch);
                         let ebps = arm.ebps;
                         (arm.into_samples(), ebps, choice)
                     })
@@ -729,13 +747,21 @@ fn max_partition_order(bs: usize, p: usize) -> u32 {
 /// identical to an independent exhaustive scan per order (the original), but
 /// computed in ONE pass: shifted sums per finest partition, merged pairwise
 /// upward — O(15n) total instead of O(15n) per order.
-fn plan_partitions(res: &[i32], bs: usize, p: usize) -> ResidualPlan {
+fn plan_partitions(
+    res: &[i32],
+    bs: usize,
+    p: usize,
+    scratch: &mut EncodeScratch,
+) -> ResidualPlan {
     let max_po = max_partition_order(bs, p);
     let finest_parts = 1usize << max_po;
     let finest_size = bs >> max_po;
 
-    // Partition-sum scratch, reused across every plan on this thread.
-    with_scratch!(SUMS: [u64; RICE_KMAX + 1], |sums| {
+    // Partition-sum scratch, owned by the encoder and reused across every plan
+    // for its life. This was a fresh `Vec` per call on the no_std path (no
+    // thread-local) — the largest single analysis allocation.
+    let sums = &mut scratch.sums;
+    {
         sums.clear();
         sums.reserve(finest_parts);
         let mut idx = 0usize;
@@ -815,7 +841,7 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize) -> ResidualPlan {
             ks: best_ks,
             bits: best_bits,
         }
-    })
+    }
 }
 
 /// Write a partitioned Rice residual body.
@@ -1156,6 +1182,7 @@ fn realize_best_window(
     bps: u32,
     ests: &[Option<LpcEstimate>],
     stats: &mut EncodeStats,
+    scratch: &mut EncodeScratch,
 ) -> Option<LpcCandidate> {
     let best_est = ests
         .iter()
@@ -1173,7 +1200,7 @@ fn realize_best_window(
                 continue; // clear loser: skip the expensive realization
             }
         }
-        if let Some(c) = realize_lpc(samples, bps, est, stats) {
+        if let Some(c) = realize_lpc(samples, bps, est, stats, &mut *scratch) {
             if best.as_ref().is_none_or(|(_, b)| c.bits < b.bits) {
                 best = Some((widx, c));
             }
@@ -1240,6 +1267,7 @@ fn realize_lpc(
     bps: u32,
     est: &LpcEstimate,
     stats: &mut EncodeStats,
+    scratch: &mut EncodeScratch,
 ) -> Option<LpcCandidate> {
     let n = samples.len();
     let order = est.order;
@@ -1248,7 +1276,7 @@ fn realize_lpc(
         return None;
     };
     let res = lpc_residual(samples, &qlp, shift, order);
-    let plan = plan_partitions(&res, n, order);
+    let plan = plan_partitions(&res, n, order, scratch);
     // hdr(8) + warm-up + precision(4) + shift(5) + coeffs + residual hdr(6) + body.
     let bits =
         8 + order as u64 * bps as u64 + 4 + 5 + order as u64 * LPC_PRECISION as u64 + 6 + plan.bits;
@@ -1608,6 +1636,7 @@ fn realize_arm(
     max_lpc_order: usize,
     wins: &WindowCache,
     stats: &mut EncodeStats,
+    scratch: &mut EncodeScratch,
 ) -> SubframeChoice {
     let samples: &[i32] = &arm.samples;
     let bps = arm.ebps;
@@ -1631,7 +1660,7 @@ fn realize_arm(
             all_ests.push(lpc_estimate(samples, bps, max_order, win, stats));
         }
     }
-    let lpc = realize_best_window(samples, bps, &all_ests, stats);
+    let lpc = realize_best_window(samples, bps, &all_ests, stats, &mut *scratch);
     let lpc_bits = lpc.as_ref().map_or(u64::MAX, |c| c.bits.saturating_add(wb));
 
     // FIXED: one-pass order estimate, then the exact residual + partition
@@ -1644,7 +1673,7 @@ fn realize_arm(
         8 + fx_order as u64 * bps as u64 + 6 + rice_bits_estimate(fx_abs, (n - fx_order) as u64);
     let fixed = if lpc.is_none() || fx_est <= lpc_bits.saturating_add(lpc_bits / 10) {
         let fx_res = fixed_residual(samples, fx_order);
-        let fx_plan = plan_partitions(&fx_res, n, fx_order);
+        let fx_plan = plan_partitions(&fx_res, n, fx_order, &mut *scratch);
         let fixed_bits = 8 + wb + fx_order as u64 * bps as u64 + 6 + fx_plan.bits;
         Some((fx_res, fx_plan, fixed_bits))
     } else {
@@ -1763,9 +1792,10 @@ fn analyze_subframe(
     max_lpc_order: usize,
     wins: &WindowCache,
     stats: &mut EncodeStats,
+    scratch: &mut EncodeScratch,
 ) -> SubframeChoice {
     let est = estimate_arm(arm, max_lpc_order, wins, stats);
-    realize_arm(arm, &est, max_lpc_order, wins, stats)
+    realize_arm(arm, &est, max_lpc_order, wins, stats, scratch)
 }
 
 /// Stereo modes whose estimated cost is within this relative margin of the
@@ -1787,6 +1817,7 @@ fn decide_stereo(
     max_lpc_order: usize,
     wins: &WindowCache,
     stats: &mut EncodeStats,
+    scratch: &mut EncodeScratch,
 ) -> (u64, Vec<(Vec<i32>, u32, SubframeChoice)>) {
     let side: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| a - b).collect();
     let mid: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| (a + b) >> 1).collect();
@@ -1828,6 +1859,7 @@ fn decide_stereo(
                     max_lpc_order,
                     wins,
                     stats,
+                    &mut *scratch,
                 ));
             }
         }
