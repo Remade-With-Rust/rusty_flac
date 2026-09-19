@@ -361,13 +361,21 @@ impl Encoder {
         let mut frame_number = 0u64;
         let mut start = 0usize;
         let mut wins = WindowCache::default();
+        // One frame writer, reused (cleared) for every frame instead of a
+        // fresh allocation per frame. Sized to the raw ceiling of the largest
+        // (first) block — blocks are non-increasing, and a lossless frame
+        // never exceeds raw — so it never reallocates.
+        let first_bs = n.min(BLOCK_SIZE);
+        let mut frame_bw =
+            BitWriter::with_capacity(first_bs * self.channels * (bps as usize / 8) + 64);
         while start < n {
             let bs = (n - start).min(BLOCK_SIZE);
             wins.ensure(bs);
-            let frame = self.encode_frame(frame_number, start, bs, bps, &wins);
-            min_fs = min_fs.min(frame.len() as u32);
-            max_fs = max_fs.max(frame.len() as u32);
-            frames.extend_from_slice(&frame);
+            self.encode_frame(frame_number, start, bs, bps, &wins, &mut frame_bw);
+            let flen = frame_bw.bytes().len() as u32;
+            min_fs = min_fs.min(flen);
+            max_fs = max_fs.max(flen);
+            frames.extend_from_slice(frame_bw.bytes());
             start += bs;
             frame_number += 1;
             self.stats.frames += 1;
@@ -425,7 +433,8 @@ impl Encoder {
         bs: usize,
         bps: u32,
         wins: &WindowCache,
-    ) -> Vec<u8> {
+        bw: &mut BitWriter,
+    ) {
         // Decide the channel layout: stereo picks the cheapest decorrelation
         // mode; mono / multichannel code each channel independently.
         //
@@ -471,7 +480,9 @@ impl Encoder {
                 ((chans.len() as u64) - 1, subs)
             };
 
-        let mut bw = BitWriter::with_capacity(bs * self.channels * (bps as usize) / 8 / 2 + 64);
+        // The frame writer is owned by the caller and cleared here, so a whole
+        // stream reuses one buffer instead of allocating one per frame.
+        bw.clear();
         // --- frame header ---
         bw.write_bits(0x3FFE, 14); // sync
         bw.write_bits(0, 1); // reserved (mandatory 0)
@@ -481,27 +492,26 @@ impl Encoder {
         bw.write_bits(assignment, 4); // 0/1..7 = independent, 8/9/10 = L-S / R-S / M-S
         bw.write_bits(sample_size_code(bps), 3);
         bw.write_bits(0, 1); // reserved (mandatory 0)
-        write_utf8(&mut bw, frame_number);
+        write_utf8(&mut *bw, frame_number);
         bw.write_bits((bs as u64) - 1, 16); // block size - 1
         let hcrc = crc8(bw.bytes());
         bw.write_bits(hcrc as u64, 8);
 
         // --- subframes (each at its own bit depth; side channels use bps+1) ---
         for (samples, sf_bps, choice) in &subframes {
-            write_subframe_from(&mut bw, samples, *sf_bps, choice, &mut self.stats);
+            write_subframe_from(&mut *bw, samples, *sf_bps, choice, &mut self.stats);
         }
 
         // --- frame footer: pad to byte, then CRC-16 of the whole frame ---
         bw.align_to_byte();
         let fcrc = crc16(bw.bytes());
         bw.write_bits(fcrc as u64, 16);
-        let out = bw.into_bytes();
         // The subframes (and their borrow of held_chans) are written; restore
-        // the channel buffers taken by the mono/multichannel path.
+        // the channel buffers taken by the mono/multichannel path. The frame
+        // bytes stay in `bw` for the caller to copy out.
         if !held_chans.is_empty() {
             self.chans = held_chans;
         }
-        out
     }
 }
 

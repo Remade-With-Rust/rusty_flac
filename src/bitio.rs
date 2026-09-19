@@ -30,6 +30,14 @@ impl BitWriter {
         }
     }
 
+    /// Reset to empty while keeping the allocated buffer, so one writer can be
+    /// reused across many frames without reallocating per frame.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.acc = 0;
+        self.nbits = 0;
+    }
+
     /// Write the low `n` bits of `val`, most-significant bit first. `n <= 56`.
     #[inline]
     pub fn write_bits(&mut self, val: u64, n: u32) {
