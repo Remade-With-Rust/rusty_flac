@@ -1613,7 +1613,12 @@ fn estimate_arm(
     // realization (realize_arm), skipping two autocorrelations per pruned arm.
     let ests: Vec<Option<LpcEstimate>> = if max_order >= 1 {
         debug_assert_eq!(wins.n, n, "window cache not sized for this block");
-        vec![lpc_estimate(samples, bps, max_order, &wins.w[0], stats, scratch)]
+        // Sized for every window: realize_arm appends the remaining windows'
+        // estimates to this same Vec, so reserving the full window count here
+        // saves it a re-grow.
+        let mut v = Vec::with_capacity(wins.w.len());
+        v.push(lpc_estimate(samples, bps, max_order, &wins.w[0], stats, scratch));
+        v
     } else {
         Vec::new()
     };
