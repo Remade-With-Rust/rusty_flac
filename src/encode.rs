@@ -19,32 +19,6 @@ use crate::bitio::BitWriter;
 use crate::crc::{crc16, crc8};
 use crate::math;
 
-/// A reusable scratch `Vec`: per thread under `std` (one allocation per
-/// thread for the life of the process), a fresh allocation per call without
-/// it. The body sees `$v: &mut Vec<$t>` either way.
-macro_rules! with_scratch {
-    ($name:ident : $t:ty, |$v:ident| $body:expr) => {{
-        #[cfg(feature = "std")]
-        {
-            thread_local! {
-                static $name: core::cell::RefCell<Vec<$t>> =
-                    const { core::cell::RefCell::new(Vec::new()) };
-            }
-            $name.with(|cell| {
-                let mut guard = cell.borrow_mut();
-                let $v: &mut Vec<$t> = &mut guard;
-                $body
-            })
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            let mut owned: Vec<$t> = Vec::new();
-            let $v: &mut Vec<$t> = &mut owned;
-            $body
-        }
-    }};
-}
-
 /// Nominal samples-per-channel per FLAC frame. 4096 is FLAC's usual default and
 /// encodes as an explicit 16-bit block size (frame-header block-size code 7).
 const BLOCK_SIZE: usize = 4096;
@@ -134,6 +108,11 @@ struct EncodeScratch {
     /// `plan_partitions` finest-partition Rice sums (the largest single
     /// analysis allocation — one `[u64; RICE_KMAX+1]` per finest partition).
     sums: Vec<[u64; RICE_KMAX + 1]>,
+    /// `autocorrelation` windowed products (`sample * window`), one f64 per
+    /// sample — a fresh block-sized buffer per subframe analysis otherwise.
+    wprod: Vec<f64>,
+    /// `autocorrelation` output, lags `0..=max_order`.
+    autoc: Vec<f64>,
 }
 
 /// A pure-Rust FLAC encoder. Feed planar or interleaved `i32` samples at the
@@ -877,25 +856,27 @@ fn write_partitioned_residual(
 /// `(a0+a1) + (a2+a3)` — the same order in the scalar twin and the AVX2
 /// kernel, so the two are bit-identical and the kernel is gated by direct
 /// comparison (`autocorr_avx2_matches_scalar`).
-fn autocorrelation(samples: &[i32], max_order: usize, win: &[f64]) -> Vec<f64> {
-    // Windowed-product scratch, reused across every subframe analysis on
-    // this thread (a fresh Vec per call was ~8 × 32 KB allocations per
-    // block); without `std` it is that fresh Vec.
-    with_scratch!(W_SCRATCH: f64, |w| {
-        w.clear();
-        w.extend(samples.iter().zip(win).map(|(&s, &g)| s as f64 * g));
-        let mut autoc = vec![0.0f64; max_order + 1];
-        #[cfg(all(target_arch = "x86_64", feature = "std"))]
-        {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                // SAFETY: guarded by the runtime AVX2 check.
-                unsafe { autocorr_avx2(w, &mut autoc) };
-                return autoc;
-            }
+fn autocorrelation(samples: &[i32], max_order: usize, win: &[f64], scratch: &mut EncodeScratch) {
+    // Windowed products and the autocorrelation output are both encoder-owned
+    // buffers, reused across every subframe analysis for the encoder's life.
+    // A fresh Vec per call was ~8 × block-sized allocations per block on the
+    // no_std path (and the output Vec allocated on std too). Result in
+    // `scratch.autoc`.
+    let w = &mut scratch.wprod;
+    w.clear();
+    w.extend(samples.iter().zip(win).map(|(&s, &g)| s as f64 * g));
+    let autoc = &mut scratch.autoc;
+    autoc.clear();
+    autoc.resize(max_order + 1, 0.0);
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the runtime AVX2 check.
+            unsafe { autocorr_avx2(w, autoc) };
+            return;
         }
-        autocorr_scalar(w, &mut autoc);
-        autoc
-    })
+    }
+    autocorr_scalar(w, autoc);
 }
 
 /// Scalar twin of the AVX2 kernel: identical striping, identical reduction.
@@ -1221,9 +1202,11 @@ fn lpc_estimate(
     max_order: usize,
     win: &[f64],
     stats: &mut EncodeStats,
+    scratch: &mut EncodeScratch,
 ) -> Option<LpcEstimate> {
     let n = samples.len();
-    let autoc = autocorrelation(samples, max_order, win);
+    autocorrelation(samples, max_order, win, &mut *scratch);
+    let autoc = &scratch.autoc;
     if autoc[0] <= 0.0 {
         return None;
     }
@@ -1580,6 +1563,7 @@ fn estimate_arm(
     max_lpc_order: usize,
     wins: &WindowCache,
     stats: &mut EncodeStats,
+    scratch: &mut EncodeScratch,
 ) -> ArmEstimate {
     let samples: &[i32] = &arm.samples;
     let bps = arm.ebps;
@@ -1597,7 +1581,7 @@ fn estimate_arm(
     // realization (realize_arm), skipping two autocorrelations per pruned arm.
     let ests: Vec<Option<LpcEstimate>> = if max_order >= 1 {
         debug_assert_eq!(wins.n, n, "window cache not sized for this block");
-        vec![lpc_estimate(samples, bps, max_order, &wins.w[0], stats)]
+        vec![lpc_estimate(samples, bps, max_order, &wins.w[0], stats, scratch)]
     } else {
         Vec::new()
     };
@@ -1657,7 +1641,7 @@ fn realize_arm(
     let mut all_ests: Vec<Option<LpcEstimate>> = est.ests.clone();
     if max_order >= 1 {
         for win in wins.w.iter().skip(all_ests.len()) {
-            all_ests.push(lpc_estimate(samples, bps, max_order, win, stats));
+            all_ests.push(lpc_estimate(samples, bps, max_order, win, stats, &mut *scratch));
         }
     }
     let lpc = realize_best_window(samples, bps, &all_ests, stats, &mut *scratch);
@@ -1794,7 +1778,7 @@ fn analyze_subframe(
     stats: &mut EncodeStats,
     scratch: &mut EncodeScratch,
 ) -> SubframeChoice {
-    let est = estimate_arm(arm, max_lpc_order, wins, stats);
+    let est = estimate_arm(arm, max_lpc_order, wins, stats, &mut *scratch);
     realize_arm(arm, &est, max_lpc_order, wins, stats, scratch)
 }
 
@@ -1830,10 +1814,10 @@ fn decide_stereo(
         ArmInput::prepare(&side, bps + 1),
     ];
     let ests = [
-        estimate_arm(&arms[0], max_lpc_order, wins, stats),
-        estimate_arm(&arms[1], max_lpc_order, wins, stats),
-        estimate_arm(&arms[2], max_lpc_order, wins, stats),
-        estimate_arm(&arms[3], max_lpc_order, wins, stats),
+        estimate_arm(&arms[0], max_lpc_order, wins, stats, &mut *scratch),
+        estimate_arm(&arms[1], max_lpc_order, wins, stats, &mut *scratch),
+        estimate_arm(&arms[2], max_lpc_order, wins, stats, &mut *scratch),
+        estimate_arm(&arms[3], max_lpc_order, wins, stats, &mut *scratch),
     ];
     // Mode order: independent / left-side / right-side / mid-side.
     let mode_arms: [[usize; 2]; 4] = [[0, 1], [0, 3], [3, 1], [2, 3]];
