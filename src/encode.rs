@@ -1688,11 +1688,13 @@ fn fixed_order_estimate(samples: &[i32]) -> (usize, u64) {
 fn fixed_sums_scalar(samples: &[i32]) -> [u64; 5] {
     let n = samples.len();
     let mut sums = [0u64; 5];
-    sums[0] = samples.iter().map(|&v| (v as i64).unsigned_abs()).sum();
     // Ramp-in: orders become defined at i >= order.
-    for i in 1..n.min(4) {
+    for i in 0..n.min(4) {
         let s = |j: usize| samples[i - j] as i64;
-        sums[1] += (s(0) - s(1)).unsigned_abs();
+        sums[0] += s(0).unsigned_abs();
+        if i >= 1 {
+            sums[1] += (s(0) - s(1)).unsigned_abs();
+        }
         if i >= 2 {
             sums[2] += (s(0) - 2 * s(1) + s(2)).unsigned_abs();
         }
@@ -1700,44 +1702,56 @@ fn fixed_sums_scalar(samples: &[i32]) -> [u64; 5] {
             sums[3] += (s(0) - 3 * s(1) + 3 * s(2) - s(3)).unsigned_abs();
         }
     }
-    // Steady state in i32, like the AVX2 kernel: |sample| < 2^25 (24-bit +
-    // side) and the order-4 coefficients sum to 16 in magnitude, so every
-    // difference is below 2^29 — exact in i32, and four of them fit a u32
-    // partial sum, which is folded into the u64 totals once per 4 samples.
-    // (On a 32-bit core that is the difference between one-instruction ops
-    // and 64-bit multiply/add/abs sequences.)
-    let diffs = |i: usize| -> [u32; 4] {
-        let (s0, s1, s2, s3, s4) = (
-            samples[i],
-            samples[i - 1],
-            samples[i - 2],
-            samples[i - 3],
-            samples[i - 4],
-        );
-        [
-            (s0 - s1).unsigned_abs(),
-            (s0 - 2 * s1 + s2).unsigned_abs(),
-            (s0 - 3 * s1 + 3 * s2 - s3).unsigned_abs(),
-            (s0 - 4 * s1 + 6 * s2 - 4 * s3 + s4).unsigned_abs(),
-        ]
-    };
-    let mut i = 4;
-    while i + 4 <= n {
-        let mut part = [0u32; 4];
-        for j in i..i + 4 {
-            for (p, d) in part.iter_mut().zip(diffs(j)) {
-                *p += d;
-            }
-        }
-        for (s, p) in sums[1..].iter_mut().zip(part) {
-            *s += p as u64;
-        }
-        i += 4;
+    if n <= 4 {
+        return sums;
     }
-    for j in i..n {
-        for (s, d) in sums[1..].iter_mut().zip(diffs(j)) {
-            *s += d as u64;
+    // Steady state: one pass with the previous sample and the previous
+    // order-1..3 differences in registers; the order-k difference is the first
+    // difference of the order-(k-1) one, which is the direct formula exactly,
+    // as integers. |sample| < 2^25 (24-bit + side), so the order-k difference
+    // is below 2^(25+k) <= 2^29: exact in i32, and four samples' worth fits a
+    // u32 partial sum, folded into the u64 totals once per 4 samples. (On a
+    // 32-bit core: one-instruction subtracts and `abs` instead of 64-bit
+    // multiply/add/abs sequences, and no per-sample call.)
+    let mut prev = samples[3];
+    let mut d1 = samples[3] - samples[2];
+    let mut d2 = d1 - (samples[2] - samples[1]);
+    let mut d3 = d2 - ((samples[2] - samples[1]) - (samples[1] - samples[0]));
+    macro_rules! step {
+        ($s0:expr, $p:ident) => {{
+            let s0: i32 = $s0;
+            let e1 = s0 - prev;
+            let e2 = e1 - d1;
+            let e3 = e2 - d2;
+            let e4 = e3 - d3;
+            $p[0] += s0.unsigned_abs();
+            $p[1] += e1.unsigned_abs();
+            $p[2] += e2.unsigned_abs();
+            $p[3] += e3.unsigned_abs();
+            $p[4] += e4.unsigned_abs();
+            prev = s0;
+            d1 = e1;
+            d2 = e2;
+            d3 = e3;
+        }};
+    }
+    let mut chunks = samples[4..].chunks_exact(4);
+    for c in &mut chunks {
+        let mut p = [0u32; 5];
+        step!(c[0], p);
+        step!(c[1], p);
+        step!(c[2], p);
+        step!(c[3], p);
+        for (s, v) in sums.iter_mut().zip(p) {
+            *s += v as u64;
         }
+    }
+    let mut p = [0u32; 5];
+    for &s0 in chunks.remainder() {
+        step!(s0, p);
+    }
+    for (s, v) in sums.iter_mut().zip(p) {
+        *s += v as u64;
     }
     sums
 }
