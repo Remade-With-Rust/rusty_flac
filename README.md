@@ -122,7 +122,7 @@ ESP32-S3:
 <sub>The 0.1.3 row is the Janus team's microphone measurement; the 0.2.0 row
 comes from the retired-instruction and cycle counters over fixed PCM. Details
 and every step are in
-[`docs/plans/esp32-encoder-cost.md`](docs/plans/esp32-encoder-cost.md).</sub>
+[`docs/plans/esp32-encoder-cost.md`](https://github.com/Remade-With-Rust/rusty_flac/blob/main/docs/plans/esp32-encoder-cost.md).</sub>
 
 What changed:
 - **The windows are a static table.** The full-block window is 5.7 KB of
