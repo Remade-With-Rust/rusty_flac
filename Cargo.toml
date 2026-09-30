@@ -42,6 +42,10 @@ libm = { version = "0.2", optional = true, default-features = false }
 name = "flacbench"
 required-features = ["std"]
 
+[[example]]
+name = "corpus_size"
+required-features = ["std"]
+
 [dev-dependencies]
 # claxon is the independent decode oracle for the encoder's lossless gate.
 claxon = "0.4"
