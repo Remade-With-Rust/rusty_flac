@@ -771,7 +771,30 @@ fn rice_sums_into(res: &[i32], out: &mut [u64]) {
 
 /// Scalar shifted sums for k = 0..out.len() — on a chip without SIMD this is
 /// one u64 add per sample per k, so stopping at the top bit is the saving.
+///
+/// `out` is sized by [`rice_stride`]: when it stops short of `RICE_KMAX + 1`,
+/// every zigzagged value is below `2^(out.len() - 1)`. If `res.len()` of those
+/// also fit 32 bits — always, for 16-bit audio — the sums are accumulated in
+/// u32 (exact, and one add per term instead of a 64-bit add with carry on a
+/// 32-bit core).
 fn rice_sums_scalar_into(res: &[i32], out: &mut [u64]) {
+    let top = out.len() - 1;
+    let cnt_bits = usize::BITS - res.len().leading_zeros();
+    if out.len() <= RICE_KMAX && top as u32 + cnt_bits <= 32 {
+        let mut acc = [0u32; RICE_KMAX];
+        let acc = &mut acc[..out.len()];
+        for &v in res {
+            let u = zigzag(v);
+            debug_assert!(u >> top == 0, "row shorter than the residual's top bit");
+            for (k, a) in acc.iter_mut().enumerate() {
+                *a += u >> k;
+            }
+        }
+        for (o, &a) in out.iter_mut().zip(acc.iter()) {
+            *o = a as u64;
+        }
+        return;
+    }
     out.fill(0);
     for &v in res {
         let u = zigzag(v);
@@ -1600,16 +1623,44 @@ fn fixed_sums_scalar(samples: &[i32]) -> [u64; 5] {
             sums[3] += (s(0) - 3 * s(1) + 3 * s(2) - s(3)).unsigned_abs();
         }
     }
-    for i in 4..n {
-        let s0 = samples[i] as i64;
-        let s1 = samples[i - 1] as i64;
-        let s2 = samples[i - 2] as i64;
-        let s3 = samples[i - 3] as i64;
-        let s4 = samples[i - 4] as i64;
-        sums[1] += (s0 - s1).unsigned_abs();
-        sums[2] += (s0 - 2 * s1 + s2).unsigned_abs();
-        sums[3] += (s0 - 3 * s1 + 3 * s2 - s3).unsigned_abs();
-        sums[4] += (s0 - 4 * s1 + 6 * s2 - 4 * s3 + s4).unsigned_abs();
+    // Steady state in i32, like the AVX2 kernel: |sample| < 2^25 (24-bit +
+    // side) and the order-4 coefficients sum to 16 in magnitude, so every
+    // difference is below 2^29 — exact in i32, and four of them fit a u32
+    // partial sum, which is folded into the u64 totals once per 4 samples.
+    // (On a 32-bit core that is the difference between one-instruction ops
+    // and 64-bit multiply/add/abs sequences.)
+    let diffs = |i: usize| -> [u32; 4] {
+        let (s0, s1, s2, s3, s4) = (
+            samples[i],
+            samples[i - 1],
+            samples[i - 2],
+            samples[i - 3],
+            samples[i - 4],
+        );
+        [
+            (s0 - s1).unsigned_abs(),
+            (s0 - 2 * s1 + s2).unsigned_abs(),
+            (s0 - 3 * s1 + 3 * s2 - s3).unsigned_abs(),
+            (s0 - 4 * s1 + 6 * s2 - 4 * s3 + s4).unsigned_abs(),
+        ]
+    };
+    let mut i = 4;
+    while i + 4 <= n {
+        let mut part = [0u32; 4];
+        for j in i..i + 4 {
+            for (p, d) in part.iter_mut().zip(diffs(j)) {
+                *p += d;
+            }
+        }
+        for (s, p) in sums[1..].iter_mut().zip(part) {
+            *s += p as u64;
+        }
+        i += 4;
+    }
+    for j in i..n {
+        for (s, d) in sums[1..].iter_mut().zip(diffs(j)) {
+            *s += d as u64;
+        }
     }
     sums
 }
@@ -2311,6 +2362,81 @@ mod tests {
                 if k == 3 {
                     assert_eq!(reused.wins.builds, builds, "tail tapers rebuilt");
                 }
+            }
+        }
+    }
+
+    /// The i32 fixed-order sums equal the original i64 formulas exactly, at
+    /// full-scale 25-bit (side-channel) amplitude and every tail length.
+    #[test]
+    fn fixed_sums_i32_match_i64_reference() {
+        let reference = |x: &[i32]| -> [u64; 5] {
+            let mut sums = [0u64; 5];
+            sums[0] = x.iter().map(|&v| (v as i64).unsigned_abs()).sum();
+            for i in 1..x.len() {
+                let s = |j: usize| if i >= j { x[i - j] as i64 } else { 0 };
+                sums[1] += (s(0) - s(1)).unsigned_abs();
+                if i >= 2 {
+                    sums[2] += (s(0) - 2 * s(1) + s(2)).unsigned_abs();
+                }
+                if i >= 3 {
+                    sums[3] += (s(0) - 3 * s(1) + 3 * s(2) - s(3)).unsigned_abs();
+                }
+                if i >= 4 {
+                    sums[4] += (s(0) - 4 * s(1) + 6 * s(2) - 4 * s(3) + s(4)).unsigned_abs();
+                }
+            }
+            sums
+        };
+        let m = (1i32 << 24) - 1;
+        let mut x = 9u64;
+        for n in [1usize, 2, 3, 4, 5, 7, 8, 9, 64, 4095, 4096] {
+            for pattern in 0..3 {
+                let v: Vec<i32> = (0..n)
+                    .map(|i| match pattern {
+                        0 => {
+                            if i % 2 == 0 {
+                                m
+                            } else {
+                                -m - 1
+                            }
+                        }
+                        1 => {
+                            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            ((x >> 39) as i32) - (1 << 24)
+                        }
+                        _ => ((i as f64 * 0.3).sin() * 30000.0) as i32,
+                    })
+                    .collect();
+                assert_eq!(
+                    fixed_sums_scalar(&v),
+                    reference(&v),
+                    "n={n} pattern={pattern}"
+                );
+            }
+        }
+    }
+
+    /// The u32-accumulated Rice sums equal the u64 ones wherever the u32 path
+    /// is taken (and the row is exact at the bound: top bit + count bits = 32).
+    #[test]
+    fn rice_sums_u32_path_is_exact() {
+        let mut x = 21u64;
+        for bits in [1u32, 8, 16, 18, 20, 26] {
+            for n in [1usize, 16, 64, 4096] {
+                let res: Vec<i32> = (0..n)
+                    .map(|_| {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(3);
+                        let lim = 1i64 << (bits - 1);
+                        (((x >> 20) as i64 % (2 * lim)) - lim) as i32
+                    })
+                    .collect();
+                let stride = rice_stride(&res);
+                let mut fast = vec![0u64; stride];
+                rice_sums_scalar_into(&res, &mut fast);
+                let mut full = [0u64; RICE_KMAX + 1];
+                rice_sums_scalar_into(&res, &mut full); // u64 path
+                assert_eq!(&full[..stride], &fast[..], "bits={bits} n={n}");
             }
         }
     }
