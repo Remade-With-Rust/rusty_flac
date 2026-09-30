@@ -106,13 +106,13 @@ pub struct EncodeStats {
 /// truncated in a way that changes an output byte.
 #[derive(Default)]
 struct EncodeScratch {
-    /// `plan_partitions` finest-partition Rice sums, flat: one row of
-    /// `stride` shifted sums per finest partition, where `stride` stops at the
-    /// residual's top bit (the rows above it are all zero and never chosen).
-    sums: Vec<u64>,
-    /// `autocorrelation` windowed products (`sample * window`), one f64 per
-    /// sample — a fresh block-sized buffer per subframe analysis otherwise.
-    wprod: Vec<f64>,
+    /// One word buffer shared by the two largest analysis stages, which never
+    /// run at the same time: `autocorrelation`'s windowed products (f64 bit
+    /// patterns, one per sample) and `plan_partitions`' Rice sums (one row of
+    /// `stride` shifted sums per finest partition, `stride` stopping at the
+    /// residual's top bit). Shared, the encoder's peak holds the larger of the
+    /// two instead of both.
+    words: Vec<u64>,
     /// `autocorrelation` output, lags `0..=max_order`.
     autoc: Vec<f64>,
     /// `plan_partitions` per-level Rice parameters for the two coding methods
@@ -883,10 +883,15 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize, scratch: &mut EncodeScratch
     // The sums were a fresh `Vec` per call on the no_std path (no
     // thread-local) — the largest single analysis allocation — and ks0/ks1
     // were a fresh pair per plan. Disjoint fields, so borrowed together.
-    let EncodeScratch { sums, ks0, ks1, .. } = scratch;
+    let EncodeScratch {
+        words: sums,
+        ks0,
+        ks1,
+        ..
+    } = scratch;
     {
         let stride = rice_stride(res);
-        sums.clear();
+        regrow(sums, finest_parts * stride);
         sums.resize(finest_parts * stride, 0);
         let mut idx = 0usize;
         for (part, row) in sums.chunks_exact_mut(stride).enumerate() {
@@ -1000,6 +1005,17 @@ fn write_partitioned_residual(
 // LPC
 // ---------------------------------------------------------------------------
 
+/// Empty `buf` and make room for `len` words. When it has to grow, the old
+/// allocation is freed first: its contents are dead, and a grow through
+/// `realloc` would hold old and new at once — on a first-fit embedded heap
+/// that is the encoder's peak.
+fn regrow(buf: &mut Vec<u64>, len: usize) {
+    buf.clear();
+    if buf.capacity() < len {
+        *buf = Vec::with_capacity(len);
+    }
+}
+
 /// Autocorrelation of the windowed samples, lags 0..=max_order.
 ///
 /// The summation uses four striped accumulators reduced as
@@ -1012,23 +1028,22 @@ fn autocorrelation(samples: &[i32], max_order: usize, win: Window, scratch: &mut
     // A fresh Vec per call was ~8 × block-sized allocations per block on the
     // no_std path (and the output Vec allocated on std too). Result in
     // `scratch.autoc`.
-    let w = &mut scratch.wprod;
-    w.clear();
+    let w = &mut scratch.words;
     // Tapers multiply; the flat middle is the sample itself (`× 1.0` is exact).
     let (h, t, n) = (win.head.len(), win.tail.len(), samples.len());
-    w.reserve(n); // one exact allocation, not three doubling ones
+    regrow(w, n);
     w.extend(
         samples[..h]
             .iter()
             .zip(win.head)
-            .map(|(&s, &g)| s as f64 * g),
+            .map(|(&s, &g)| (s as f64 * g).to_bits()),
     );
-    w.extend(samples[h..n - t].iter().map(|&s| s as f64));
+    w.extend(samples[h..n - t].iter().map(|&s| (s as f64).to_bits()));
     w.extend(
         samples[n - t..]
             .iter()
             .zip(win.tail)
-            .map(|(&s, &g)| s as f64 * g),
+            .map(|(&s, &g)| (s as f64 * g).to_bits()),
     );
     let autoc = &mut scratch.autoc;
     autoc.clear();
@@ -1045,22 +1060,23 @@ fn autocorrelation(samples: &[i32], max_order: usize, win: Window, scratch: &mut
 }
 
 /// Scalar twin of the AVX2 kernel: identical striping, identical reduction.
-fn autocorr_scalar(w: &[f64], autoc: &mut [f64]) {
+fn autocorr_scalar(w: &[u64], autoc: &mut [f64]) {
     let n = w.len();
+    let w = |i: usize| f64::from_bits(w[i]);
     for (lag, a) in autoc.iter_mut().enumerate() {
         let m = n - lag;
         let mut acc = [0.0f64; 4];
         let chunks = m / 4;
         for c in 0..chunks {
             let i = c * 4;
-            acc[0] += w[lag + i] * w[i];
-            acc[1] += w[lag + i + 1] * w[i + 1];
-            acc[2] += w[lag + i + 2] * w[i + 2];
-            acc[3] += w[lag + i + 3] * w[i + 3];
+            acc[0] += w(lag + i) * w(i);
+            acc[1] += w(lag + i + 1) * w(i + 1);
+            acc[2] += w(lag + i + 2) * w(i + 2);
+            acc[3] += w(lag + i + 3) * w(i + 3);
         }
         let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
         for i in chunks * 4..m {
-            sum += w[lag + i] * w[i];
+            sum += w(lag + i) * w(i);
         }
         *a = sum;
     }
@@ -1068,10 +1084,11 @@ fn autocorr_scalar(w: &[f64], autoc: &mut [f64]) {
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx2")]
-unsafe fn autocorr_avx2(w: &[f64], autoc: &mut [f64]) {
+unsafe fn autocorr_avx2(w: &[u64], autoc: &mut [f64]) {
     use core::arch::x86_64::*;
     let n = w.len();
-    let p = w.as_ptr();
+    // f64 bit patterns: same size and alignment, every pattern a valid f64.
+    let p = w.as_ptr() as *const f64;
     for (lag, a) in autoc.iter_mut().enumerate() {
         let m = n - lag;
         let chunks = m / 4;
@@ -2317,10 +2334,10 @@ mod tests {
         }
         let mut x = 3u64;
         for n in [15usize, 64, 1000, 4096, 4097] {
-            let w: Vec<f64> = (0..n)
+            let w: Vec<u64> = (0..n)
                 .map(|i| {
                     x = x.wrapping_mul(6364136223846793005).wrapping_add(99);
-                    ((x >> 33) as i32 as f64) * 1e-3 + (i as f64 * 0.13).sin() * 500.0
+                    (((x >> 33) as i32 as f64) * 1e-3 + (i as f64 * 0.13).sin() * 500.0).to_bits()
                 })
                 .collect();
             let mut a = vec![0.0f64; 13];
