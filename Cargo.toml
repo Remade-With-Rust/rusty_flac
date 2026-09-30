@@ -1,6 +1,6 @@
 [package]
 name = "rusty_flac"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -40,6 +40,10 @@ libm = { version = "0.2", optional = true, default-features = false }
 
 [[example]]
 name = "flacbench"
+required-features = ["std"]
+
+[[example]]
+name = "corpus_size"
 required-features = ["std"]
 
 [dev-dependencies]

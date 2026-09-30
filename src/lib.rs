@@ -35,6 +35,7 @@ mod decode;
 mod encode;
 mod math;
 mod md5;
+mod window_table;
 
 pub use decode::{decode, DecodeError, Decoder, StreamInfo};
 pub use encode::{EncodeError, EncodeStats, Encoder};
