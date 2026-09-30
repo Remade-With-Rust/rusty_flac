@@ -445,7 +445,7 @@ impl Encoder {
         // after the frame is written. Stereo's mid and side are computed, so
         // those subframes stay owned (`Cow::Owned`).
         let mut held_chans: Vec<Vec<i32>> = Vec::new();
-        let (assignment, subframes): (u64, Vec<(Cow<[i32]>, u32, SubframeChoice)>) =
+        let (assignment, subframes): (u64, Vec<Subframe<'_>>) =
             if self.channels == 2 {
                 let (assignment, subs) = decide_stereo(
                     &self.chans[0][start..start + bs],
@@ -829,7 +829,7 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize, scratch: &mut EncodeScratch
                 best_po = po;
                 best_bits = bits;
                 best_ks.clear();
-                best_ks.extend_from_slice(if method == 1 { &ks1 } else { &ks0 });
+                best_ks.extend_from_slice(if method == 1 { ks1 } else { ks0 });
             }
             if po == 0 {
                 break;
@@ -1244,7 +1244,7 @@ fn lpc_estimate(
         return None;
     }
     let mut errs = [0.0f64; 32];
-    let found = levinson_errs(&autoc, max_order, &mut errs);
+    let found = levinson_errs(autoc, max_order, &mut errs);
     if found == 0 {
         return None;
     }
@@ -1269,7 +1269,7 @@ fn lpc_estimate(
             best_idx = idx;
         }
     }
-    let coeffs = levinson_coeffs(&autoc, best_idx + 1);
+    let coeffs = levinson_coeffs(autoc, best_idx + 1);
     Some(LpcEstimate {
         order: best_idx + 1,
         coeffs,
@@ -1509,6 +1509,10 @@ fn fixed_residual(samples: &[i32], order: usize) -> Vec<i32> {
     }
     res
 }
+
+/// One coded subframe: its (possibly wasted-shifted) samples, effective bit
+/// depth, and chosen encoding.
+type Subframe<'a> = (Cow<'a, [i32]>, u32, SubframeChoice);
 
 /// The chosen subframe encoding for a channel + its bit cost.
 struct SubframeChoice {
@@ -1859,7 +1863,7 @@ fn decide_stereo<'a>(
     wins: &WindowCache,
     stats: &mut EncodeStats,
     scratch: &mut EncodeScratch,
-) -> (u64, Vec<(Cow<'a, [i32]>, u32, SubframeChoice)>) {
+) -> (u64, Vec<Subframe<'a>>) {
     let side: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| a - b).collect();
     let mid: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| (a + b) >> 1).collect();
 
