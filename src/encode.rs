@@ -546,21 +546,25 @@ impl Encoder {
 /// and 0.2).
 const WINDOW_ALPHAS: [f64; 2] = [0.5, 0.2];
 
-/// A Tukey window held as its two cosine tapers: `head` covers samples
+/// Window values are Q15 integers: `w` in `[0, 1]` is `round(w · 2^15)`, so
+/// the flat middle (exactly 1.0) is `1 << 15` and windowing is an integer
+/// multiply — the autocorrelation that follows is exact integer arithmetic.
+const WIN_Q: u32 = 15;
+
+/// A Tukey window held as its two cosine tapers (Q15): `head` covers samples
 /// `0..head.len()`, `tail` the last `tail.len()`, and every sample between
-/// them is exactly `1.0` — so it is never stored, and never multiplied by
-/// (`s as f64 * 1.0` is `s as f64`, bit for bit).
+/// them is exactly `1 << WIN_Q` — so it is never stored.
 #[derive(Clone, Copy)]
 struct Window<'a> {
-    head: &'a [f64],
-    tail: &'a [f64],
+    head: &'a [u16],
+    tail: &'a [u16],
 }
 
 /// Owned tapers of one window, for a block size with no static table.
 #[derive(Default)]
 struct Tapers {
-    head: Vec<f64>,
-    tail: Vec<f64>,
+    head: Vec<u16>,
+    tail: Vec<u16>,
 }
 
 impl Tapers {
@@ -573,10 +577,8 @@ impl Tapers {
 }
 
 /// The windows for the current block size. A full [`BLOCK_SIZE`] block (every
-/// block but a stream's last) reads tables that are never rebuilt: static and
-/// generated with the same `libm::cos` on `libm` builds, computed once per
-/// process with the platform `cos` otherwise. Only a short final block builds
-/// its own tapers.
+/// block but a stream's last) reads a static table; only a short final block
+/// builds its own tapers.
 #[derive(Default)]
 struct WindowCache {
     /// Block size the windows are currently for.
@@ -618,9 +620,9 @@ impl WindowCache {
     }
 }
 
-/// The [`BLOCK_SIZE`] windows from the generated table — bit-identical to
-/// [`tukey_tapers`] under `libm` (gated by `window_table_is_runtime_tukey`).
-#[cfg(feature = "libm")]
+/// The [`BLOCK_SIZE`] windows: a generated table, identical to
+/// [`tukey_tapers`] (gated by `window_table_is_runtime_tukey`). Integer, so
+/// one table serves `libm` and platform-libm builds alike.
 fn full_block_window(k: usize) -> Window<'static> {
     use crate::window_table::{HEAD_0, HEAD_1, TAIL_0, TAIL_1};
     if k == 0 {
@@ -636,19 +638,16 @@ fn full_block_window(k: usize) -> Window<'static> {
     }
 }
 
-/// The [`BLOCK_SIZE`] windows with the platform `cos`: computed on first use
-/// and kept for the life of the process. (The `libm` table would pin `libm`'s
-/// last bits onto a platform-libm build and change its output.)
-#[cfg(not(feature = "libm"))]
-fn full_block_window(k: usize) -> Window<'static> {
-    static FULL: std::sync::OnceLock<[Tapers; 2]> = std::sync::OnceLock::new();
-    FULL.get_or_init(|| WINDOW_ALPHAS.map(|alpha| tukey_tapers(BLOCK_SIZE, alpha)))[k].view()
+/// A window value in `[0, 1]` as Q15, rounded half up (`w · 2^15` is exact
+/// and far below 2^52, so `+ 0.5` then truncation is exact rounding).
+fn q15(w: f64) -> u16 {
+    (w * (1u32 << WIN_Q) as f64 + 0.5) as u16
 }
 
-/// A Tukey window of `n` samples as its two cosine tapers: the full-length
-/// window's per-sample arithmetic (kept below as the test oracle), evaluated
-/// only where the window is not `1.0`. `x = i/(n-1)` is monotonic in `i`, so
-/// the head is a prefix and the tail a suffix.
+/// A Tukey window of `n` samples as its two cosine tapers in Q15: the
+/// full-length window's per-sample arithmetic (kept below as the test oracle),
+/// evaluated only where the window is not `1.0`. `x = i/(n-1)` is monotonic
+/// in `i`, so the head is a prefix and the tail a suffix.
 fn tukey_tapers(n: usize, alpha: f64) -> Tapers {
     let mut t = Tapers::default();
     if n <= 1 {
@@ -658,8 +657,9 @@ fn tukey_tapers(n: usize, alpha: f64) -> Tapers {
     let mut i = 0;
     while i < n && x_of(i) < alpha / 2.0 {
         let x = x_of(i);
-        t.head
-            .push(0.5 * (1.0 + math::cos(core::f64::consts::PI * (2.0 * x / alpha - 1.0))));
+        t.head.push(q15(0.5
+            * (1.0
+                + math::cos(core::f64::consts::PI * (2.0 * x / alpha - 1.0)))));
         i += 1;
     }
     let mut j = n;
@@ -668,15 +668,17 @@ fn tukey_tapers(n: usize, alpha: f64) -> Tapers {
     }
     for idx in j..n {
         let x = x_of(idx);
-        t.tail.push(
-            0.5 * (1.0 + math::cos(core::f64::consts::PI * (2.0 * x / alpha - 2.0 / alpha + 1.0))),
-        );
+        t.tail.push(q15(0.5
+            * (1.0
+                + math::cos(
+                    core::f64::consts::PI * (2.0 * x / alpha - 2.0 / alpha + 1.0),
+                ))));
     }
     t
 }
 
 /// Tukey apodization window: flat middle with cosine tapers. The original
-/// full-length form, kept as the oracle for [`tukey_tapers`].
+/// full-length float form, kept as the oracle for [`tukey_tapers`].
 #[cfg(test)]
 fn tukey_window(n: usize, alpha: f64) -> Vec<f64> {
     let mut w = vec![1.0f64; n];
@@ -1050,101 +1052,164 @@ fn regrow(buf: &mut Vec<u64>, len: usize) {
     }
 }
 
-/// Autocorrelation of the windowed samples, lags 0..=max_order.
+/// Autocorrelation of the windowed samples, lags 0..=max_order, in exact
+/// integer arithmetic; the result is in the units of the float
+/// autocorrelation it replaced (`Σ (s·w)(s'·w')`, kept as `autocorr_f64` in
+/// the tests), so Levinson and the order-selection estimate read it as before.
 ///
-/// The summation uses four striped accumulators reduced as
-/// `(a0+a1) + (a2+a3)` — the same order in the scalar twin and the AVX2
-/// kernel, so the two are bit-identical and the kernel is gated by direct
-/// comparison (`autocorr_avx2_matches_scalar`).
+/// The windowed samples `x = s·q` (Q15 window `q`) are normalised by a
+/// right shift so that `|x| ≤ 2^b` with `2b + ⌈log2 n⌉ ≤ 62`: every product
+/// is at most 2^(2b) and a lag sum of at most n of them cannot overflow i64.
+/// Integer sums are exact in any order, so host, chip and the AVX2 kernel
+/// agree by construction — and on a chip without an f64 FPU each
+/// multiply-add is a 32×32→64 multiply and an add instead of two soft-float
+/// calls (the stage was 57–78 % of an ESP32-S3 encode;
+/// docs/plans/esp32-encoder-cost.md item 2).
 fn autocorrelation(samples: &[i32], max_order: usize, win: Window, scratch: &mut EncodeScratch) {
-    // Windowed products and the autocorrelation output are both encoder-owned
-    // buffers, reused across every subframe analysis for the encoder's life.
-    // A fresh Vec per call was ~8 × block-sized allocations per block on the
-    // no_std path (and the output Vec allocated on std too). Result in
+    // Windowed samples and the autocorrelation output are both encoder-owned
+    // buffers, reused across every subframe analysis. Result in
     // `scratch.autoc`.
     let w = &mut scratch.words;
-    // Tapers multiply; the flat middle is the sample itself (`× 1.0` is exact).
     let (h, t, n) = (win.head.len(), win.tail.len(), samples.len());
     regrow(w, n);
+    // Normalisation shift, from the samples: |x| = |s|·q < 2^(bits(s) + 15),
+    // so `x >> sh` is at most 2^b in magnitude. (Derived from the samples
+    // rather than from a pass over the products, and fused into the one
+    // windowing pass below.)
+    let lg = usize::BITS - n.saturating_sub(1).leading_zeros(); // ⌈log2 n⌉
+    let b = (62 - lg) / 2;
+    let big = samples.iter().fold(0u32, |a, &s| a | s.unsigned_abs());
+    let sh = (u32::BITS - big.leading_zeros() + WIN_Q).saturating_sub(b);
+    // |s| < 2^25 (24-bit + side), q ≤ 2^15: every s·q fits i64 with room.
     w.extend(
         samples[..h]
             .iter()
             .zip(win.head)
-            .map(|(&s, &g)| (s as f64 * g).to_bits()),
+            .map(|(&s, &q)| ((s as i64 * q as i64) >> sh) as u64),
     );
-    w.extend(samples[h..n - t].iter().map(|&s| (s as f64).to_bits()));
+    // The flat middle, (s << 15) >> sh, as one shift of s.
+    if sh <= WIN_Q {
+        let up = WIN_Q - sh;
+        w.extend(samples[h..n - t].iter().map(|&s| ((s as i64) << up) as u64));
+    } else {
+        let down = sh - WIN_Q;
+        w.extend(
+            samples[h..n - t]
+                .iter()
+                .map(|&s| ((s >> down) as i64) as u64),
+        );
+    }
     w.extend(
         samples[n - t..]
             .iter()
             .zip(win.tail)
-            .map(|(&s, &g)| (s as f64 * g).to_bits()),
+            .map(|(&s, &q)| ((s as i64 * q as i64) >> sh) as u64),
     );
+    let mut sums = [0i64; 33];
+    let sums = &mut sums[..=max_order];
+    autocorr_int(w, sums);
+    // x = s·w·2^(15−sh), so Σ x·x' = Σ (s·w)(s'·w') · 2^(30−2sh).
+    let scale = pow2(2 * sh as i32 - 2 * WIN_Q as i32);
     let autoc = &mut scratch.autoc;
     autoc.clear();
-    autoc.resize(max_order + 1, 0.0);
+    autoc.extend(sums.iter().map(|&v| v as f64 * scale));
+}
+
+/// `2^e` as an f64, exactly (normal range only).
+fn pow2(e: i32) -> f64 {
+    debug_assert!((-1022..=1023).contains(&e));
+    f64::from_bits(((1023 + e) as u64) << 52)
+}
+
+/// Lag sums `out[lag] = Σ x[i]·x[i+lag]` over normalised windowed samples
+/// (i64 bit patterns whose values fit i32).
+fn autocorr_int(w: &[u64], out: &mut [i64]) {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: guarded by the runtime AVX2 check.
-            unsafe { autocorr_avx2(w, autoc) };
+            unsafe { autocorr_int_avx2(w, out) };
             return;
         }
     }
-    autocorr_scalar(w, autoc);
+    autocorr_int_scalar(w, out);
 }
 
-/// Scalar twin of the AVX2 kernel: identical striping, identical reduction.
-fn autocorr_scalar(w: &[u64], autoc: &mut [f64]) {
+/// Scalar lag sums: a sign-extended 32×32→64 multiply and a 64-bit add per
+/// term (native `mull`/`mulsh` on Xtensa, no libcall).
+fn autocorr_int_scalar(w: &[u64], out: &mut [i64]) {
     let n = w.len();
-    let w = |i: usize| f64::from_bits(w[i]);
-    for (lag, a) in autoc.iter_mut().enumerate() {
-        let m = n - lag;
-        let mut acc = [0.0f64; 4];
-        let chunks = m / 4;
-        for c in 0..chunks {
-            let i = c * 4;
-            acc[0] += w(lag + i) * w(i);
-            acc[1] += w(lag + i + 1) * w(i + 1);
-            acc[2] += w(lag + i + 2) * w(i + 2);
-            acc[3] += w(lag + i + 3) * w(i + 3);
-        }
-        let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
-        for i in chunks * 4..m {
-            sum += w(lag + i) * w(i);
-        }
-        *a = sum;
+    for (lag, o) in out.iter_mut().enumerate() {
+        *o = w[..n - lag]
+            .iter()
+            .zip(&w[lag..])
+            .map(|(&a, &b)| (a as i32 as i64) * (b as i32 as i64))
+            .sum();
     }
 }
 
+/// AVX2 lag sums: `_mm256_mul_epi32` is exactly the sign-extended low-32-bit
+/// product the scalar twin forms, four samples at a time. Lags go in groups
+/// of four sharing each `y` load, one accumulator per lag, so the loop is
+/// bound by loads rather than by an add chain. Integer, so neither the lane
+/// nor the group order matters (gated by `autocorr_int_avx2_matches_scalar`).
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx2")]
-unsafe fn autocorr_avx2(w: &[u64], autoc: &mut [f64]) {
+unsafe fn autocorr_int_avx2(w: &[u64], out: &mut [i64]) {
+    let mut lag0 = 0;
+    while lag0 < out.len() {
+        match out.len() - lag0 {
+            1 => lag_group::<1>(w, lag0, out),
+            2 => lag_group::<2>(w, lag0, out),
+            3 => lag_group::<3>(w, lag0, out),
+            _ => lag_group::<4>(w, lag0, out),
+        }
+        lag0 += (out.len() - lag0).min(4);
+    }
+}
+
+/// Lags `lag0..lag0 + K` of [`autocorr_int_avx2`]: vector over the range
+/// every lag in the group covers, then each lag's own scalar tail.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2")]
+unsafe fn lag_group<const K: usize>(w: &[u64], lag0: usize, out: &mut [i64]) {
     use core::arch::x86_64::*;
     let n = w.len();
-    // f64 bit patterns: same size and alignment, every pattern a valid f64.
-    let p = w.as_ptr() as *const f64;
-    for (lag, a) in autoc.iter_mut().enumerate() {
-        let m = n - lag;
-        let chunks = m / 4;
-        let mut acc = _mm256_setzero_pd();
-        for c in 0..chunks {
-            let i = c * 4;
-            let x = _mm256_loadu_pd(p.add(lag + i));
-            let y = _mm256_loadu_pd(p.add(i));
-            // Plain mul+add (no FMA) so the scalar twin matches bit-for-bit.
-            acc = _mm256_add_pd(acc, _mm256_mul_pd(x, y));
+    let p = w.as_ptr();
+    let m = n - (lag0 + K - 1);
+    let chunks = m / 4;
+    let mut acc = [_mm256_setzero_si256(); K];
+    for c in 0..chunks {
+        let i = c * 4;
+        let y = _mm256_loadu_si256(p.add(i) as *const __m256i);
+        for (j, a) in acc.iter_mut().enumerate() {
+            let x = _mm256_loadu_si256(p.add(lag0 + j + i) as *const __m256i);
+            *a = _mm256_add_epi64(*a, _mm256_mul_epi32(x, y));
         }
-        // Reduce as (a0+a1) + (a2+a3), matching the scalar twin.
-        let lo = _mm256_castpd256_pd128(acc);
-        let hi = _mm256_extractf128_pd(acc, 1);
-        let a01 = _mm_add_pd(lo, _mm_unpackhi_pd(lo, lo));
-        let a23 = _mm_add_pd(hi, _mm_unpackhi_pd(hi, hi));
-        let mut sum = _mm_cvtsd_f64(a01) + _mm_cvtsd_f64(a23);
-        for i in chunks * 4..m {
-            sum += *p.add(lag + i) * *p.add(i);
-        }
-        *a = sum;
     }
+    for (j, a) in acc.iter().enumerate() {
+        let lag = lag0 + j;
+        let mut lanes = [0i64; 4];
+        _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, *a);
+        let mut sum = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+        for i in chunks * 4..n - lag {
+            sum += (w[lag + i] as i32 as i64) * (w[i] as i32 as i64);
+        }
+        out[lag] = sum;
+    }
+}
+
+/// The float autocorrelation the integer one replaced — the test oracle.
+#[cfg(test)]
+fn autocorr_f64(samples: &[i32], win: &[f64], max_order: usize) -> Vec<f64> {
+    let x: Vec<f64> = samples
+        .iter()
+        .zip(win)
+        .map(|(&s, &g)| s as f64 * g)
+        .collect();
+    (0..=max_order)
+        .map(|lag| (0..x.len() - lag).map(|i| x[i] * x[i + lag]).sum())
+        .collect()
 }
 
 /// Levinson-Durbin, error-only pass: fills `errs[i]` with the residual energy
@@ -2143,24 +2208,21 @@ fn decide_stereo<'a>(
 mod tests {
     use super::*;
 
-    /// The tapers are the full-length window's non-1.0 samples, bit for bit,
-    /// and every sample between them is exactly 1.0 — at every size a stream
-    /// can end on (the short final block), plus the degenerate ones.
+    /// The tapers are the full-length window's non-1.0 samples in Q15, and
+    /// every sample between them is exactly 1.0 — at every size a stream can
+    /// end on (the short final block), plus the degenerate ones.
     #[test]
     fn tukey_tapers_match_full_window() {
+        assert_eq!(q15(1.0), 1 << WIN_Q);
         for n in (0..=600).chain([1023, 1024, 3904, 4000, 4095, BLOCK_SIZE]) {
             for &alpha in &WINDOW_ALPHAS {
                 let full = tukey_window(n, alpha);
                 let t = tukey_tapers(n, alpha);
                 let (h, tl) = (t.head.len(), t.tail.len());
                 assert!(h + tl <= n, "n={n} alpha={alpha}");
-                let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-                assert_eq!(bits(&t.head), bits(&full[..h]), "head n={n} alpha={alpha}");
-                assert_eq!(
-                    bits(&t.tail),
-                    bits(&full[n - tl..]),
-                    "tail n={n} alpha={alpha}"
-                );
+                let q = |v: &[f64]| v.iter().map(|&x| q15(x)).collect::<Vec<_>>();
+                assert_eq!(t.head, q(&full[..h]), "head n={n} alpha={alpha}");
+                assert_eq!(t.tail, q(&full[n - tl..]), "tail n={n} alpha={alpha}");
                 assert!(
                     full[h..n - tl]
                         .iter()
@@ -2253,17 +2315,21 @@ mod tests {
         }
     }
 
-    /// The generated `BLOCK_SIZE` table is `tukey_tapers` under `libm`, bit for
-    /// bit. `RUSTY_FLAC_REGEN_WINDOWS=1` rewrites `src/window_table.rs`.
-    #[cfg(feature = "libm")]
+    /// The generated `BLOCK_SIZE` table is `tukey_tapers`, value for value — on
+    /// `libm` builds by construction (it is generated with `libm::cos`), and on
+    /// platform-libm builds because a last-bit difference in `cos` does not
+    /// move a Q15 rounding (checked here on every host the suite runs on).
+    /// `RUSTY_FLAC_REGEN_WINDOWS=1` (with `--features libm`) rewrites
+    /// `src/window_table.rs`.
     #[test]
     fn window_table_is_runtime_tukey() {
         let tapers = WINDOW_ALPHAS.map(|a| tukey_tapers(BLOCK_SIZE, a));
+        #[cfg(feature = "libm")]
         if std::env::var_os("RUSTY_FLAC_REGEN_WINDOWS").is_some() {
             use std::fmt::Write as _;
             let mut src = std::string::String::from(
                 "//! Tukey tapers of the two LPC windows for a full block (4096 samples,\n\
-                 //! alpha 0.5 and 0.2) as f64 bit patterns. GENERATED with `libm::cos` by\n\
+                 //! alpha 0.5 and 0.2) in Q15. GENERATED with `libm::cos` by\n\
                  //! `RUSTY_FLAC_REGEN_WINDOWS=1 cargo test --features libm --lib\n\
                  //! window_table_is_runtime_tukey`, which also gates this file against the\n\
                  //! runtime computation. Do not edit.\n",
@@ -2272,14 +2338,14 @@ mod tests {
                 for (name, v) in [("HEAD", &t.head), ("TAIL", &t.tail)] {
                     writeln!(
                         src,
-                        "\npub(crate) static {name}_{k}: [f64; {}] = [",
+                        "\npub(crate) static {name}_{k}: [u16; {}] = [",
                         v.len()
                     )
                     .unwrap();
-                    for chunk in v.chunks(3) {
+                    for chunk in v.chunks(12) {
                         src.push_str("   ");
                         for x in chunk {
-                            write!(src, " f64::from_bits(0x{:016x}),", x.to_bits()).unwrap();
+                            write!(src, " {x},").unwrap();
                         }
                         src.push('\n');
                     }
@@ -2292,9 +2358,86 @@ mod tests {
         }
         for (k, t) in tapers.iter().enumerate() {
             let w = full_block_window(k);
-            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-            assert_eq!(bits(w.head), bits(&t.head), "head {k}");
-            assert_eq!(bits(w.tail), bits(&t.tail), "tail {k}");
+            assert_eq!(w.head, &t.head[..], "head {k}");
+            assert_eq!(w.tail, &t.tail[..], "tail {k}");
+        }
+    }
+
+    /// The integer autocorrelation tracks the float one it replaced: same
+    /// units, relative error far below anything LPC order selection or the
+    /// Levinson recursion can see — on quiet, loud, tonal and full-scale
+    /// 24-bit content, full and short blocks.
+    #[test]
+    fn int_autocorrelation_tracks_float() {
+        let mut x = 17u64;
+        let mut rnd = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 33) as f64 / (1u64 << 31) as f64) - 0.5
+        };
+        for &(n, amp, tone) in &[
+            (BLOCK_SIZE, 300.0, 0.0),
+            (BLOCK_SIZE, 30000.0, 0.3),
+            (BLOCK_SIZE, 8_000_000.0, 1.0),
+            (BLOCK_SIZE, 16_700_000.0, 0.0),
+            (3904, 2000.0, 0.5),
+            (37, 5.0, 0.0),
+        ] {
+            let s: Vec<i32> = (0..n)
+                .map(|i| (amp * (tone * (i as f64 * 0.02).sin() + (1.0 - tone) * rnd())) as i32)
+                .collect();
+            let mut cache = WindowCache::default();
+            cache.ensure(n);
+            for (k, &alpha) in WINDOW_ALPHAS.iter().enumerate() {
+                let want = autocorr_f64(&s, &tukey_window(n, alpha), 12);
+                let mut scratch = EncodeScratch::default();
+                autocorrelation(&s, 12, cache.get(k), &mut scratch);
+                for (lag, (&got, &w)) in scratch.autoc.iter().zip(&want).enumerate() {
+                    let err = (got - w).abs() / want[0];
+                    assert!(err < 2e-4, "n={n} amp={amp} k={k} lag={lag}: {got} vs {w}");
+                }
+            }
+        }
+    }
+
+    /// The normalisation keeps every lag sum inside i64: full-scale 25-bit
+    /// (side-channel) content, the largest block, every lag — checked against
+    /// the same sums in i128.
+    #[test]
+    fn int_autocorrelation_cannot_overflow() {
+        let n = BLOCK_SIZE;
+        for pattern in 0..3 {
+            let s: Vec<i32> = (0..n)
+                .map(|i| {
+                    let m = (1i32 << 24) - 1;
+                    match pattern {
+                        0 => m,
+                        1 => {
+                            if i % 2 == 0 {
+                                m
+                            } else {
+                                -m - 1
+                            }
+                        }
+                        _ => -m - 1,
+                    }
+                })
+                .collect();
+            let mut cache = WindowCache::default();
+            cache.ensure(n);
+            let mut scratch = EncodeScratch::default();
+            autocorrelation(&s, 32, cache.get(0), &mut scratch);
+            let w = &scratch.words;
+            for lag in 0..=32 {
+                let wide: i128 = (0..n - lag)
+                    .map(|i| (w[i] as i32 as i128) * (w[i + lag] as i32 as i128))
+                    .sum();
+                assert!(wide.abs() < (1i128 << 62), "pattern {pattern} lag {lag}");
+                let mut out = [0i64; 33];
+                autocorr_int_scalar(w, &mut out);
+                assert_eq!(out[lag] as i128, wide, "pattern {pattern} lag {lag}");
+            }
         }
     }
 
@@ -2393,29 +2536,27 @@ mod tests {
         );
     }
 
-    /// The AVX2 autocorrelation must match the scalar twin bit-for-bit
-    /// (identical striping and reduction order — no FMA, no reassociation).
+    /// The AVX2 integer lag sums equal the scalar twin's exactly (integer
+    /// sums: any order is the same sum), on every length and tail.
     #[test]
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    fn autocorr_avx2_matches_scalar() {
+    fn autocorr_int_avx2_matches_scalar() {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
         let mut x = 3u64;
         for n in [15usize, 64, 1000, 4096, 4097] {
             let w: Vec<u64> = (0..n)
-                .map(|i| {
+                .map(|_| {
                     x = x.wrapping_mul(6364136223846793005).wrapping_add(99);
-                    (((x >> 33) as i32 as f64) * 1e-3 + (i as f64 * 0.13).sin() * 500.0).to_bits()
+                    (((x >> 32) as i32) >> 7) as i64 as u64 // |v| < 2^25
                 })
                 .collect();
-            let mut a = vec![0.0f64; 13];
-            let mut b = vec![0.0f64; 13];
-            autocorr_scalar(&w, &mut a);
-            unsafe { autocorr_avx2(&w, &mut b) };
-            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
-                assert_eq!(x.to_bits(), y.to_bits(), "lag {i} differs at n={n}");
-            }
+            let mut a = [0i64; 13];
+            let mut b = [0i64; 13];
+            autocorr_int_scalar(&w, &mut a);
+            unsafe { autocorr_int_avx2(&w, &mut b) };
+            assert_eq!(a, b, "n={n}");
         }
     }
 

@@ -72,10 +72,10 @@ fn encoder_output_digest() {
     assert_eq!(d, PINNED_LIBM, "encoder output changed (libm build)");
 }
 
-/// Pinned at the commit that introduced this gate (main after the nine
-/// `perf(encode)` commits), libm build.
+/// Pinned when the LPC autocorrelation became integer arithmetic (Q15
+/// windows, exact i64 lag sums). Before that the digest was
+/// 0x3a773fb5ac8bbf92 under libm and 0x0023377cf11261fb with the platform
+/// libm (x86_64-pc-windows-msvc); since then both builds produce this one on
+/// that host, as they do for every file of the corpus gate.
 #[cfg(feature = "libm")]
-const PINNED_LIBM: u64 = 0x3a773fb5ac8bbf92;
-
-// Platform-libm (default `std`) digest on x86_64-pc-windows-msvc at the same
-// commit, for a same-machine before/after comparison: 0x0023377cf11261fb.
+const PINNED_LIBM: u64 = 0xe97402e36f8f2429;

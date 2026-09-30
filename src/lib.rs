@@ -35,7 +35,6 @@ mod decode;
 mod encode;
 mod math;
 mod md5;
-#[cfg(feature = "libm")]
 mod window_table;
 
 pub use decode::{decode, DecodeError, Decoder, StreamInfo};
