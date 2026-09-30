@@ -106,9 +106,10 @@ pub struct EncodeStats {
 /// truncated in a way that changes an output byte.
 #[derive(Default)]
 struct EncodeScratch {
-    /// `plan_partitions` finest-partition Rice sums (the largest single
-    /// analysis allocation — one `[u64; RICE_KMAX+1]` per finest partition).
-    sums: Vec<[u64; RICE_KMAX + 1]>,
+    /// `plan_partitions` finest-partition Rice sums, flat: one row of
+    /// `stride` shifted sums per finest partition, where `stride` stops at the
+    /// residual's top bit (the rows above it are all zero and never chosen).
+    sums: Vec<u64>,
     /// `autocorrelation` windowed products (`sample * window`), one f64 per
     /// sample — a fresh block-sized buffer per subframe analysis otherwise.
     wprod: Vec<f64>,
@@ -715,27 +716,44 @@ fn zigzag(v: i32) -> u32 {
 /// The exact Rice bit cost at parameter k is `sums[k] + cnt·(1 + k)` — one
 /// pass yields every parameter's exact cost. Integer sums, so the AVX2 path
 /// is exact (gated by `rice_sums_avx2_matches_scalar`).
+///
+/// Only `out.len()` sums are produced (k = 0..out.len()): the caller sizes
+/// `out` to the residual's top bit, above which every sum is zero.
 #[inline]
-fn rice_sums(res: &[i32]) -> [u64; RICE_KMAX + 1] {
+fn rice_sums_into(res: &[i32], out: &mut [u64]) {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: guarded by the runtime AVX2 check.
-            return unsafe { rice_sums_avx2(res) };
+            let all = unsafe { rice_sums_avx2(res) };
+            out.copy_from_slice(&all[..out.len()]);
+            return;
         }
     }
-    rice_sums_scalar(res)
+    rice_sums_scalar_into(res, out);
 }
 
-fn rice_sums_scalar(res: &[i32]) -> [u64; RICE_KMAX + 1] {
-    let mut sums = [0u64; RICE_KMAX + 1];
+/// Scalar shifted sums for k = 0..out.len() — on a chip without SIMD this is
+/// one u64 add per sample per k, so stopping at the top bit is the saving.
+fn rice_sums_scalar_into(res: &[i32], out: &mut [u64]) {
+    out.fill(0);
     for &v in res {
         let u = zigzag(v);
-        for (k, s) in sums.iter_mut().enumerate() {
+        for (k, s) in out.iter_mut().enumerate() {
             *s += (u >> k) as u64;
         }
     }
-    sums
+}
+
+/// Number of shifted sums worth keeping for a residual: k = 0..=top, where
+/// `top` is the bit length of the largest zigzagged value (capped at
+/// RICE_KMAX). Every sum at k >= that bit length is zero, and
+/// `best_k_from_sums`' convex scan stops at the first k whose cost rises —
+/// which it does at the first all-zero k (cost `cnt·(1+k)` grows by `cnt`) —
+/// so a scan over the truncated row chooses exactly what a full one would.
+fn rice_stride(res: &[i32]) -> usize {
+    let or = res.iter().fold(0u32, |a, &v| a | zigzag(v));
+    ((32 - or.leading_zeros()) as usize).min(RICE_KMAX) + 1
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -789,7 +807,7 @@ unsafe fn rice_sums_avx2(res: &[i32]) -> [u64; RICE_KMAX + 1] {
 /// body bit cost, from precomputed shifted sums. The cost is convex in k
 /// (unary halves, suffix grows by cnt), so the scan stops at the first rise.
 #[inline]
-fn best_k_from_sums(sums: &[u64; RICE_KMAX + 1], cnt: u64, kmax: usize) -> (u32, u64) {
+fn best_k_from_sums(sums: &[u64], cnt: u64, kmax: usize) -> (u32, u64) {
     let mut best_k = 0u32;
     let mut best = sums[0] + cnt;
     for (k, &s) in sums.iter().enumerate().take(kmax + 1).skip(1) {
@@ -867,16 +885,17 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize, scratch: &mut EncodeScratch
     // were a fresh pair per plan. Disjoint fields, so borrowed together.
     let EncodeScratch { sums, ks0, ks1, .. } = scratch;
     {
+        let stride = rice_stride(res);
         sums.clear();
-        sums.reserve(finest_parts);
+        sums.resize(finest_parts * stride, 0);
         let mut idx = 0usize;
-        for part in 0..finest_parts {
+        for (part, row) in sums.chunks_exact_mut(stride).enumerate() {
             let cnt = if part == 0 {
                 finest_size - p
             } else {
                 finest_size
             };
-            sums.push(rice_sums(&res[idx..idx + cnt]));
+            rice_sums_into(&res[idx..idx + cnt], row);
             idx += cnt;
         }
 
@@ -906,7 +925,7 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize, scratch: &mut EncodeScratch
             ks0.clear();
             ks1.clear();
             let (mut bits0, mut bits1) = (0u64, 0u64);
-            for (part, s) in sums[..n_part].iter().enumerate() {
+            for (part, s) in sums[..n_part * stride].chunks_exact(stride).enumerate() {
                 let cnt = if part == 0 { psize - p } else { psize } as u64;
                 let (k1, kb1) = best_k_from_sums(s, cnt, RICE_KMAX);
                 let (k0, kb0) = if k1 as usize <= RICE_KMAX_M0 {
@@ -934,15 +953,13 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize, scratch: &mut EncodeScratch
             if po == 0 {
                 break;
             }
-            // Merge pairs into the front half for the next-coarser level.
+            // Merge pairs into the front half for the next-coarser level: row
+            // i = row 2i + row 2i+1. Row i is written only after rows <= 2i+1
+            // are read, so ascending order is safe in place.
             for i in 0..n_part / 2 {
-                let (a, b) = sums.split_at_mut(2 * i + 1);
-                let dst = &mut a[2 * i];
-                for (x, y) in dst.iter_mut().zip(&b[0]) {
-                    *x += y;
-                }
-                if i != 2 * i {
-                    sums.swap(i, 2 * i);
+                for k in 0..stride {
+                    sums[i * stride + k] =
+                        sums[2 * i * stride + k] + sums[(2 * i + 1) * stride + k];
                 }
             }
             po -= 1;
@@ -2102,6 +2119,53 @@ mod tests {
         }
     }
 
+    /// A Rice-parameter scan over a row truncated at the residual's top bit
+    /// picks the same parameter and cost as the scan over all 31 sums, for
+    /// every kmax the planner uses and every magnitude class.
+    #[test]
+    fn truncated_rice_row_matches_full_row() {
+        let mut x = 5u64;
+        for bits in 0..=31u32 {
+            for n in [1usize, 2, 7, 64, 1024] {
+                let res: Vec<i32> = (0..n)
+                    .map(|_| {
+                        x = x
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        let v = (x >> 32) as u32 as i64;
+                        let m = if bits == 0 {
+                            0
+                        } else {
+                            (1i64 << (bits - 1)) - 1
+                        };
+                        (if m == 0 { 0 } else { v % (m + 1) - m / 2 }) as i32
+                    })
+                    .chain(core::iter::once(if bits >= 2 {
+                        -(1i32 << (bits - 2))
+                    } else {
+                        0
+                    }))
+                    .collect();
+                let mut full = [0u64; RICE_KMAX + 1];
+                rice_sums_scalar_into(&res, &mut full);
+                let stride = rice_stride(&res);
+                let mut row = vec![0u64; stride];
+                rice_sums_into(&res, &mut row);
+                assert_eq!(&full[..stride], &row[..], "bits={bits} n={n}");
+                assert!(full[stride..].iter().all(|&s| s == 0) || stride == RICE_KMAX + 1);
+                for cnt in [res.len() as u64, res.len() as u64 + 3] {
+                    for kmax in [RICE_KMAX_M0, RICE_KMAX] {
+                        assert_eq!(
+                            best_k_from_sums(&full, cnt, kmax),
+                            best_k_from_sums(&row, cnt, kmax),
+                            "bits={bits} n={n} cnt={cnt} kmax={kmax}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// The generated `BLOCK_SIZE` table is `tukey_tapers` under `libm`, bit for
     /// bit. `RUSTY_FLAC_REGEN_WINDOWS=1` rewrites `src/window_table.rs`.
     #[cfg(feature = "libm")]
@@ -2329,11 +2393,9 @@ mod tests {
                     ((x >> 30) as i32) >> ((x >> 60) & 15) // wide dynamic range
                 })
                 .collect();
-            assert_eq!(
-                rice_sums_scalar(&res),
-                unsafe { rice_sums_avx2(&res) },
-                "n={n}"
-            );
+            let mut scalar = [0u64; RICE_KMAX + 1];
+            rice_sums_scalar_into(&res, &mut scalar);
+            assert_eq!(scalar, unsafe { rice_sums_avx2(&res) }, "n={n}");
         }
     }
 
