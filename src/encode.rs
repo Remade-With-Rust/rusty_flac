@@ -445,40 +445,39 @@ impl Encoder {
         // after the frame is written. Stereo's mid and side are computed, so
         // those subframes stay owned (`Cow::Owned`).
         let mut held_chans: Vec<Vec<i32>> = Vec::new();
-        let (assignment, subframes): (u64, Vec<Subframe<'_>>) =
-            if self.channels == 2 {
-                let (assignment, subs) = decide_stereo(
-                    &self.chans[0][start..start + bs],
-                    &self.chans[1][start..start + bs],
-                    bps,
-                    self.max_lpc_order,
-                    wins,
-                    &mut self.stats,
-                    &mut self.scratch,
-                );
-                match assignment {
-                    1 => self.stats.stereo_independent += 1,
-                    8 => self.stats.stereo_left_side += 1,
-                    9 => self.stats.stereo_right_side += 1,
-                    _ => self.stats.stereo_mid_side += 1,
-                }
-                (assignment, subs)
-            } else {
-                let max_lpc_order = self.max_lpc_order;
-                held_chans = core::mem::take(&mut self.chans);
-                let chans = &held_chans;
-                let stats = &mut self.stats;
-                let scratch = &mut self.scratch;
-                let subs = (0..chans.len())
-                    .map(|c| {
-                        let arm = ArmInput::prepare(&chans[c][start..start + bs], bps);
-                        let choice = analyze_subframe(&arm, max_lpc_order, wins, stats, scratch);
-                        let ebps = arm.ebps;
-                        (arm.into_cow(), ebps, choice)
-                    })
-                    .collect();
-                ((chans.len() as u64) - 1, subs)
-            };
+        let (assignment, subframes): (u64, Vec<Subframe<'_>>) = if self.channels == 2 {
+            let (assignment, subs) = decide_stereo(
+                &self.chans[0][start..start + bs],
+                &self.chans[1][start..start + bs],
+                bps,
+                self.max_lpc_order,
+                wins,
+                &mut self.stats,
+                &mut self.scratch,
+            );
+            match assignment {
+                1 => self.stats.stereo_independent += 1,
+                8 => self.stats.stereo_left_side += 1,
+                9 => self.stats.stereo_right_side += 1,
+                _ => self.stats.stereo_mid_side += 1,
+            }
+            (assignment, subs)
+        } else {
+            let max_lpc_order = self.max_lpc_order;
+            held_chans = core::mem::take(&mut self.chans);
+            let chans = &held_chans;
+            let stats = &mut self.stats;
+            let scratch = &mut self.scratch;
+            let subs = (0..chans.len())
+                .map(|c| {
+                    let arm = ArmInput::prepare(&chans[c][start..start + bs], bps);
+                    let choice = analyze_subframe(&arm, max_lpc_order, wins, stats, scratch);
+                    let ebps = arm.ebps;
+                    (arm.into_cow(), ebps, choice)
+                })
+                .collect();
+            ((chans.len() as u64) - 1, subs)
+        };
 
         // The frame writer is owned by the caller and cleared here, so a whole
         // stream reuses one buffer instead of allocating one per frame.
@@ -519,16 +518,47 @@ impl Encoder {
 // Windows
 // ---------------------------------------------------------------------------
 
-/// The two apodization windows tried per LPC candidate, cached per block size
-/// (only the final short block differs from BLOCK_SIZE, so this rebuilds twice
-/// per stream instead of twice per subframe).
+/// The two apodization windows tried per LPC candidate (Tukey, `alpha` 0.5
+/// and 0.2).
+const WINDOW_ALPHAS: [f64; 2] = [0.5, 0.2];
+
+/// A Tukey window held as its two cosine tapers: `head` covers samples
+/// `0..head.len()`, `tail` the last `tail.len()`, and every sample between
+/// them is exactly `1.0` — so it is never stored, and never multiplied by
+/// (`s as f64 * 1.0` is `s as f64`, bit for bit).
+#[derive(Clone, Copy)]
+struct Window<'a> {
+    head: &'a [f64],
+    tail: &'a [f64],
+}
+
+/// Owned tapers of one window, for a block size with no static table.
+#[derive(Default)]
+struct Tapers {
+    head: Vec<f64>,
+    tail: Vec<f64>,
+}
+
+impl Tapers {
+    fn view(&self) -> Window<'_> {
+        Window {
+            head: &self.head,
+            tail: &self.tail,
+        }
+    }
+}
+
+/// The windows for the current block size. A full [`BLOCK_SIZE`] block (every
+/// block but a stream's last) reads tables that are never rebuilt: static and
+/// generated with the same `libm::cos` on `libm` builds, computed once per
+/// process with the platform `cos` otherwise. Only a short final block builds
+/// its own tapers.
 #[derive(Default)]
 struct WindowCache {
     n: usize,
-    w: [Vec<f64>; 2],
+    full: bool,
+    short: [Tapers; 2],
 }
-
-const WINDOW_ALPHAS: [f64; 2] = [0.5, 0.2];
 
 impl WindowCache {
     fn ensure(&mut self, n: usize) {
@@ -536,13 +566,83 @@ impl WindowCache {
             return;
         }
         self.n = n;
-        for (slot, &alpha) in self.w.iter_mut().zip(&WINDOW_ALPHAS) {
-            *slot = tukey_window(n, alpha);
+        self.full = n == BLOCK_SIZE;
+        if !self.full {
+            for (slot, &alpha) in self.short.iter_mut().zip(&WINDOW_ALPHAS) {
+                *slot = tukey_tapers(n, alpha);
+            }
+        }
+    }
+
+    fn get(&self, k: usize) -> Window<'_> {
+        if self.full {
+            full_block_window(k)
+        } else {
+            self.short[k].view()
         }
     }
 }
 
-/// Tukey apodization window: flat middle with cosine tapers.
+/// The [`BLOCK_SIZE`] windows from the generated table — bit-identical to
+/// [`tukey_tapers`] under `libm` (gated by `window_table_is_runtime_tukey`).
+#[cfg(feature = "libm")]
+fn full_block_window(k: usize) -> Window<'static> {
+    use crate::window_table::{HEAD_0, HEAD_1, TAIL_0, TAIL_1};
+    if k == 0 {
+        Window {
+            head: &HEAD_0,
+            tail: &TAIL_0,
+        }
+    } else {
+        Window {
+            head: &HEAD_1,
+            tail: &TAIL_1,
+        }
+    }
+}
+
+/// The [`BLOCK_SIZE`] windows with the platform `cos`: computed on first use
+/// and kept for the life of the process. (The `libm` table would pin `libm`'s
+/// last bits onto a platform-libm build and change its output.)
+#[cfg(not(feature = "libm"))]
+fn full_block_window(k: usize) -> Window<'static> {
+    static FULL: std::sync::OnceLock<[Tapers; 2]> = std::sync::OnceLock::new();
+    FULL.get_or_init(|| WINDOW_ALPHAS.map(|alpha| tukey_tapers(BLOCK_SIZE, alpha)))[k].view()
+}
+
+/// A Tukey window of `n` samples as its two cosine tapers: the full-length
+/// window's per-sample arithmetic (kept below as the test oracle), evaluated
+/// only where the window is not `1.0`. `x = i/(n-1)` is monotonic in `i`, so
+/// the head is a prefix and the tail a suffix.
+fn tukey_tapers(n: usize, alpha: f64) -> Tapers {
+    let mut t = Tapers::default();
+    if n <= 1 {
+        return t;
+    }
+    let x_of = |i: usize| i as f64 / (n - 1) as f64;
+    let mut i = 0;
+    while i < n && x_of(i) < alpha / 2.0 {
+        let x = x_of(i);
+        t.head
+            .push(0.5 * (1.0 + math::cos(core::f64::consts::PI * (2.0 * x / alpha - 1.0))));
+        i += 1;
+    }
+    let mut j = n;
+    while j > i && x_of(j - 1) > 1.0 - alpha / 2.0 {
+        j -= 1;
+    }
+    for idx in j..n {
+        let x = x_of(idx);
+        t.tail.push(
+            0.5 * (1.0 + math::cos(core::f64::consts::PI * (2.0 * x / alpha - 2.0 / alpha + 1.0))),
+        );
+    }
+    t
+}
+
+/// Tukey apodization window: flat middle with cosine tapers. The original
+/// full-length form, kept as the oracle for [`tukey_tapers`].
+#[cfg(test)]
 fn tukey_window(n: usize, alpha: f64) -> Vec<f64> {
     let mut w = vec![1.0f64; n];
     if n <= 1 {
@@ -889,7 +989,7 @@ fn write_partitioned_residual(
 /// `(a0+a1) + (a2+a3)` — the same order in the scalar twin and the AVX2
 /// kernel, so the two are bit-identical and the kernel is gated by direct
 /// comparison (`autocorr_avx2_matches_scalar`).
-fn autocorrelation(samples: &[i32], max_order: usize, win: &[f64], scratch: &mut EncodeScratch) {
+fn autocorrelation(samples: &[i32], max_order: usize, win: Window, scratch: &mut EncodeScratch) {
     // Windowed products and the autocorrelation output are both encoder-owned
     // buffers, reused across every subframe analysis for the encoder's life.
     // A fresh Vec per call was ~8 × block-sized allocations per block on the
@@ -897,7 +997,21 @@ fn autocorrelation(samples: &[i32], max_order: usize, win: &[f64], scratch: &mut
     // `scratch.autoc`.
     let w = &mut scratch.wprod;
     w.clear();
-    w.extend(samples.iter().zip(win).map(|(&s, &g)| s as f64 * g));
+    // Tapers multiply; the flat middle is the sample itself (`× 1.0` is exact).
+    let (h, t, n) = (win.head.len(), win.tail.len(), samples.len());
+    w.extend(
+        samples[..h]
+            .iter()
+            .zip(win.head)
+            .map(|(&s, &g)| s as f64 * g),
+    );
+    w.extend(samples[h..n - t].iter().map(|&s| s as f64));
+    w.extend(
+        samples[n - t..]
+            .iter()
+            .zip(win.tail)
+            .map(|(&s, &g)| s as f64 * g),
+    );
     let autoc = &mut scratch.autoc;
     autoc.clear();
     autoc.resize(max_order + 1, 0.0);
@@ -1233,7 +1347,7 @@ fn lpc_estimate(
     samples: &[i32],
     bps: u32,
     max_order: usize,
-    win: &[f64],
+    win: Window,
     stats: &mut EncodeStats,
     scratch: &mut EncodeScratch,
 ) -> Option<LpcEstimate> {
@@ -1629,9 +1743,14 @@ fn estimate_arm(
         // Sized for every window: realize_arm appends the remaining windows'
         // estimates to this same Vec, so reserving the full window count here
         // saves it a re-grow.
-        let mut v = Vec::with_capacity(wins.w.len());
+        let mut v = Vec::with_capacity(WINDOW_ALPHAS.len());
         v.push(lpc_estimate(
-            samples, bps, max_order, &wins.w[0], stats, scratch,
+            samples,
+            bps,
+            max_order,
+            wins.get(0),
+            stats,
+            scratch,
         ));
         v
     } else {
@@ -1694,12 +1813,12 @@ fn realize_arm(
     let max_order = max_lpc_order.min(n / 2);
     let mut all_ests: Vec<Option<LpcEstimate>> = est.ests;
     if max_order >= 1 {
-        for win in wins.w.iter().skip(all_ests.len()) {
+        for k in all_ests.len()..WINDOW_ALPHAS.len() {
             all_ests.push(lpc_estimate(
                 samples,
                 bps,
                 max_order,
-                win,
+                wins.get(k),
                 stats,
                 &mut *scratch,
             ));
@@ -1954,6 +2073,79 @@ fn decide_stereo<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tapers are the full-length window's non-1.0 samples, bit for bit,
+    /// and every sample between them is exactly 1.0 — at every size a stream
+    /// can end on (the short final block), plus the degenerate ones.
+    #[test]
+    fn tukey_tapers_match_full_window() {
+        for n in (0..=600).chain([1023, 1024, 3904, 4000, 4095, BLOCK_SIZE]) {
+            for &alpha in &WINDOW_ALPHAS {
+                let full = tukey_window(n, alpha);
+                let t = tukey_tapers(n, alpha);
+                let (h, tl) = (t.head.len(), t.tail.len());
+                assert!(h + tl <= n, "n={n} alpha={alpha}");
+                let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&t.head), bits(&full[..h]), "head n={n} alpha={alpha}");
+                assert_eq!(
+                    bits(&t.tail),
+                    bits(&full[n - tl..]),
+                    "tail n={n} alpha={alpha}"
+                );
+                assert!(
+                    full[h..n - tl]
+                        .iter()
+                        .all(|&w| w.to_bits() == 1.0f64.to_bits()),
+                    "middle n={n} alpha={alpha}"
+                );
+            }
+        }
+    }
+
+    /// The generated `BLOCK_SIZE` table is `tukey_tapers` under `libm`, bit for
+    /// bit. `RUSTY_FLAC_REGEN_WINDOWS=1` rewrites `src/window_table.rs`.
+    #[cfg(feature = "libm")]
+    #[test]
+    fn window_table_is_runtime_tukey() {
+        let tapers = WINDOW_ALPHAS.map(|a| tukey_tapers(BLOCK_SIZE, a));
+        if std::env::var_os("RUSTY_FLAC_REGEN_WINDOWS").is_some() {
+            use std::fmt::Write as _;
+            let mut src = std::string::String::from(
+                "//! Tukey tapers of the two LPC windows for a full block (4096 samples,\n\
+                 //! alpha 0.5 and 0.2) as f64 bit patterns. GENERATED with `libm::cos` by\n\
+                 //! `RUSTY_FLAC_REGEN_WINDOWS=1 cargo test --features libm --lib\n\
+                 //! window_table_is_runtime_tukey`, which also gates this file against the\n\
+                 //! runtime computation. Do not edit.\n",
+            );
+            for (k, t) in tapers.iter().enumerate() {
+                for (name, v) in [("HEAD", &t.head), ("TAIL", &t.tail)] {
+                    writeln!(
+                        src,
+                        "\npub(crate) static {name}_{k}: [f64; {}] = [",
+                        v.len()
+                    )
+                    .unwrap();
+                    for chunk in v.chunks(3) {
+                        src.push_str("   ");
+                        for x in chunk {
+                            write!(src, " f64::from_bits(0x{:016x}),", x.to_bits()).unwrap();
+                        }
+                        src.push('\n');
+                    }
+                    src.push_str("];\n");
+                }
+            }
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/window_table.rs");
+            std::fs::write(path, src).unwrap();
+            return;
+        }
+        for (k, t) in tapers.iter().enumerate() {
+            let w = full_block_window(k);
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(w.head), bits(&t.head), "head {k}");
+            assert_eq!(bits(w.tail), bits(&t.tail), "tail {k}");
+        }
+    }
 
     fn sine_stereo(n: usize) -> (Vec<i32>, Vec<i32>) {
         let l: Vec<i32> = (0..n)
