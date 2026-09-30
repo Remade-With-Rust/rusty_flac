@@ -769,38 +769,42 @@ fn rice_sums_into(res: &[i32], out: &mut [u64]) {
     rice_sums_scalar_into(res, out);
 }
 
-/// Scalar shifted sums for k = 0..out.len() — on a chip without SIMD this is
-/// one u64 add per sample per k, so stopping at the top bit is the saving.
+/// Scalar shifted sums for k = 0..out.len(), at a per-sample cost that does
+/// not grow with the number of k (this is the path a chip without SIMD runs).
 ///
-/// `out` is sized by [`rice_stride`]: when it stops short of `RICE_KMAX + 1`,
-/// every zigzagged value is below `2^(out.len() - 1)`. If `res.len()` of those
-/// also fit 32 bits — always, for 16-bit audio — the sums are accumulated in
-/// u32 (exact, and one add per term instead of a 64-bit add with carry on a
-/// 32-bit core).
+/// `S_0 = Σ u`, and `S_{k+1} = (S_k − B_k) / 2` exactly, where `B_k` counts
+/// the values with bit k set (`S_k − B_k = Σ 2·(u >> (k+1))`). The column
+/// counts `B_k` come from bit-sliced vertical counters: `planes[j]` holds bit
+/// j of every column's count, and adding a value is a binary increment across
+/// the planes — about two plane updates per sample on average — instead of
+/// one add per k per sample.
 fn rice_sums_scalar_into(res: &[i32], out: &mut [u64]) {
-    let top = out.len() - 1;
-    let cnt_bits = usize::BITS - res.len().leading_zeros();
-    if out.len() <= RICE_KMAX && top as u32 + cnt_bits <= 32 {
-        let mut acc = [0u32; RICE_KMAX];
-        let acc = &mut acc[..out.len()];
-        for &v in res {
-            let u = zigzag(v);
-            debug_assert!(u >> top == 0, "row shorter than the residual's top bit");
-            for (k, a) in acc.iter_mut().enumerate() {
-                *a += u >> k;
-            }
-        }
-        for (o, &a) in out.iter_mut().zip(acc.iter()) {
-            *o = a as u64;
-        }
-        return;
-    }
-    out.fill(0);
+    let mut planes = [0u32; 33];
+    let mut s0 = 0u64;
     for &v in res {
         let u = zigzag(v);
-        for (k, s) in out.iter_mut().enumerate() {
-            *s += (u >> k) as u64;
+        s0 += u as u64;
+        let mut carry = u;
+        let mut j = 0;
+        while carry != 0 {
+            let p = planes[j];
+            planes[j] = p ^ carry;
+            carry &= p;
+            j += 1;
         }
+    }
+    // Counts are < 2^33, so only the planes up to the last non-zero one hold
+    // bits.
+    let used = planes.iter().rposition(|&p| p != 0).map_or(0, |j| j + 1);
+    let mut sk = s0;
+    for (k, o) in out.iter_mut().enumerate() {
+        *o = sk;
+        let bk: u64 = planes[..used]
+            .iter()
+            .enumerate()
+            .map(|(j, &p)| (((p >> k) & 1) as u64) << j)
+            .sum();
+        sk = (sk - bk) >> 1;
     }
 }
 
@@ -2417,26 +2421,37 @@ mod tests {
         }
     }
 
-    /// The u32-accumulated Rice sums equal the u64 ones wherever the u32 path
-    /// is taken (and the row is exact at the bound: top bit + count bits = 32).
+    /// The bit-sliced Rice sums equal the definition `Σ (u >> k)` exactly, for
+    /// every magnitude up to the largest residual (|r| < 2^30, u < 2^31), every
+    /// k, and partition sizes from 1 to a whole block.
     #[test]
-    fn rice_sums_u32_path_is_exact() {
+    fn rice_sums_scalar_match_definition() {
         let mut x = 21u64;
-        for bits in [1u32, 8, 16, 18, 20, 26] {
-            for n in [1usize, 16, 64, 4096] {
+        for bits in [0u32, 1, 2, 8, 16, 18, 20, 26, 31] {
+            for n in [1usize, 2, 3, 16, 64, 255, 4096] {
                 let res: Vec<i32> = (0..n)
                     .map(|_| {
                         x = x.wrapping_mul(6364136223846793005).wrapping_add(3);
+                        if bits == 0 {
+                            return 0;
+                        }
                         let lim = 1i64 << (bits - 1);
                         (((x >> 20) as i64 % (2 * lim)) - lim) as i32
                     })
                     .collect();
+                let mut want = [0u64; RICE_KMAX + 1];
+                for &v in &res {
+                    for (k, w) in want.iter_mut().enumerate() {
+                        *w += (zigzag(v) >> k) as u64;
+                    }
+                }
+                let mut got = [0u64; RICE_KMAX + 1];
+                rice_sums_scalar_into(&res, &mut got);
+                assert_eq!(got, want, "bits={bits} n={n}");
                 let stride = rice_stride(&res);
-                let mut fast = vec![0u64; stride];
-                rice_sums_scalar_into(&res, &mut fast);
-                let mut full = [0u64; RICE_KMAX + 1];
-                rice_sums_scalar_into(&res, &mut full); // u64 path
-                assert_eq!(&full[..stride], &fast[..], "bits={bits} n={n}");
+                let mut row = vec![0u64; stride];
+                rice_sums_scalar_into(&res, &mut row);
+                assert_eq!(&row[..], &want[..stride], "short row, bits={bits} n={n}");
             }
         }
     }
