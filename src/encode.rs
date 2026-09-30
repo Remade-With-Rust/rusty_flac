@@ -755,12 +755,7 @@ fn max_partition_order(bs: usize, p: usize) -> u32 {
 /// identical to an independent exhaustive scan per order (the original), but
 /// computed in ONE pass: shifted sums per finest partition, merged pairwise
 /// upward — O(15n) total instead of O(15n) per order.
-fn plan_partitions(
-    res: &[i32],
-    bs: usize,
-    p: usize,
-    scratch: &mut EncodeScratch,
-) -> ResidualPlan {
+fn plan_partitions(res: &[i32], bs: usize, p: usize, scratch: &mut EncodeScratch) -> ResidualPlan {
     let max_po = max_partition_order(bs, p);
     let finest_parts = 1usize << max_po;
     let finest_size = bs >> max_po;
@@ -824,7 +819,11 @@ fn plan_partitions(
                 bits0 += 4 + kb0;
                 bits1 += 5 + kb1;
             }
-            let (method, bits) = if bits1 < bits0 { (1, bits1) } else { (0, bits0) };
+            let (method, bits) = if bits1 < bits0 {
+                (1, bits1)
+            } else {
+                (0, bits0)
+            };
             if bits <= best_bits {
                 best_method = method;
                 best_po = po;
@@ -1627,7 +1626,9 @@ fn estimate_arm(
         // estimates to this same Vec, so reserving the full window count here
         // saves it a re-grow.
         let mut v = Vec::with_capacity(wins.w.len());
-        v.push(lpc_estimate(samples, bps, max_order, &wins.w[0], stats, scratch));
+        v.push(lpc_estimate(
+            samples, bps, max_order, &wins.w[0], stats, scratch,
+        ));
         v
     } else {
         Vec::new()
@@ -1690,7 +1691,14 @@ fn realize_arm(
     let mut all_ests: Vec<Option<LpcEstimate>> = est.ests;
     if max_order >= 1 {
         for win in wins.w.iter().skip(all_ests.len()) {
-            all_ests.push(lpc_estimate(samples, bps, max_order, win, stats, &mut *scratch));
+            all_ests.push(lpc_estimate(
+                samples,
+                bps,
+                max_order,
+                win,
+                stats,
+                &mut *scratch,
+            ));
         }
     }
     let lpc = realize_best_window(samples, bps, &all_ests, stats, &mut *scratch);
