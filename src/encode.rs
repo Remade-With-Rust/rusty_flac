@@ -781,11 +781,22 @@ fn rice_sums_scalar_into(res: &[i32], out: &mut [u64]) {
     let top = out.len() - 1;
     let cnt_bits = usize::BITS - res.len().leading_zeros();
     if out.len() <= RICE_KMAX && top as u32 + cnt_bits <= 32 {
+        debug_assert!(
+            res.iter().all(|&v| zigzag(v) >> top == 0),
+            "row below top bit"
+        );
+        // Rows of up to 20 sums (all of 16-bit audio) use a body unrolled at
+        // that width: every shift an immediate, every accumulator a register
+        // (constant indices), no per-k loop. The generic loop below costs 9
+        // instructions per (sample, k) on Xtensa (shift-amount setup, load,
+        // add, store, loop control); opt-level "s" does not unroll it.
+        if let Some(row) = RICE_ROWS.get(out.len()) {
+            return row(res, out);
+        }
         let mut acc = [0u32; RICE_KMAX];
         let acc = &mut acc[..out.len()];
         for &v in res {
             let u = zigzag(v);
-            debug_assert!(u >> top == 0, "row shorter than the residual's top bit");
             for (k, a) in acc.iter_mut().enumerate() {
                 *a += u >> k;
             }
@@ -803,6 +814,72 @@ fn rice_sums_scalar_into(res: &[i32], out: &mut [u64]) {
         }
     }
 }
+
+/// Unrolled u32 row bodies for [`rice_sums_scalar_into`], one per width.
+macro_rules! rice_rows {
+    ($($name:ident, $n:literal, $($k:literal)+;)+) => {
+        $(
+            fn $name(res: &[i32], out: &mut [u64]) {
+                let mut acc = [0u32; $n];
+                for &v in res {
+                    let u = zigzag(v);
+                    $(acc[$k] += u >> $k;)+
+                }
+                for (o, a) in out.iter_mut().zip(acc) {
+                    *o = a as u64;
+                }
+            }
+        )+
+    };
+}
+rice_rows! {
+    rice_row_1, 1, 0;
+    rice_row_2, 2, 0 1;
+    rice_row_3, 3, 0 1 2;
+    rice_row_4, 4, 0 1 2 3;
+    rice_row_5, 5, 0 1 2 3 4;
+    rice_row_6, 6, 0 1 2 3 4 5;
+    rice_row_7, 7, 0 1 2 3 4 5 6;
+    rice_row_8, 8, 0 1 2 3 4 5 6 7;
+    rice_row_9, 9, 0 1 2 3 4 5 6 7 8;
+    rice_row_10, 10, 0 1 2 3 4 5 6 7 8 9;
+    rice_row_11, 11, 0 1 2 3 4 5 6 7 8 9 10;
+    rice_row_12, 12, 0 1 2 3 4 5 6 7 8 9 10 11;
+    rice_row_13, 13, 0 1 2 3 4 5 6 7 8 9 10 11 12;
+    rice_row_14, 14, 0 1 2 3 4 5 6 7 8 9 10 11 12 13;
+    rice_row_15, 15, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14;
+    rice_row_16, 16, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15;
+    rice_row_17, 17, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16;
+    rice_row_18, 18, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17;
+    rice_row_19, 19, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18;
+    rice_row_20, 20, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19;
+}
+
+/// Row bodies by width (index 0 unused: a row always has k = 0).
+type RiceRow = fn(&[i32], &mut [u64]);
+static RICE_ROWS: [RiceRow; 21] = [
+    rice_row_1,
+    rice_row_1,
+    rice_row_2,
+    rice_row_3,
+    rice_row_4,
+    rice_row_5,
+    rice_row_6,
+    rice_row_7,
+    rice_row_8,
+    rice_row_9,
+    rice_row_10,
+    rice_row_11,
+    rice_row_12,
+    rice_row_13,
+    rice_row_14,
+    rice_row_15,
+    rice_row_16,
+    rice_row_17,
+    rice_row_18,
+    rice_row_19,
+    rice_row_20,
+];
 
 /// Number of shifted sums worth keeping for a residual: k = 0..=top, where
 /// `top` is the bit length of the largest zigzagged value (capped at
