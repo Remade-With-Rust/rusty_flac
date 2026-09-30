@@ -1016,6 +1016,7 @@ fn autocorrelation(samples: &[i32], max_order: usize, win: Window, scratch: &mut
     w.clear();
     // Tapers multiply; the flat middle is the sample itself (`× 1.0` is exact).
     let (h, t, n) = (win.head.len(), win.tail.len(), samples.len());
+    w.reserve(n); // one exact allocation, not three doubling ones
     w.extend(
         samples[..h]
             .iter()
