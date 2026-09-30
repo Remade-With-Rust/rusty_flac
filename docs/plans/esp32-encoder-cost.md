@@ -261,8 +261,10 @@ the host's, all 16 rows.
 - **Grow-before-free.** Buffers are freed before they grow (`df00a64`),
   because a `realloc` held both copies at the peak for loud L8.
 - **Peak ceilings.** `tests/peak_heap.rs` gates per-stream peaks in bytes,
-  next to the allocation count. The 0.1.3 → `main` attribution per commit
-  is in `b3791cf`'s parent log.
+  next to the allocation count. Per-commit attribution of the 0.1.3 →
+  `main` rise, measured on the host at 4096 samples: e580e94 +2,032 B,
+  9683926 +9,300, **e820e5e +32,808**, b348eb3 +2,048, d76fb39 −11,284,
+  efd545a +8,256.
 - **32-bit arithmetic** (`1253475`) in the scalar fixed-order and Rice sums,
   byte-identical: 25.4 → 21.5 ms at L0.
 - **Tried and reverted.** A bit-sliced constant-cost Rice kernel
