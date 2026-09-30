@@ -177,20 +177,24 @@ fn dump(pcm: &[u8], level: u32) {
 }
 
 /// Ceilings, bytes, for the chip's shape: the measured peak rounded up to
-/// the next KiB, so any regression of a block-sized buffer fails.
+/// the next KiB, so any regression of a block-sized buffer fails. For
+/// reference, 0.1.3 peaked at 84,848 / 188,796 / 209,276 B (quiet 512 /
+/// 4096 / 8192, level 0) and the perf(encode) series before these ceilings
+/// at 92,100 / 231,876 / 252,356 B -- too much for an 8,192-sample stream on
+/// a 256 KB ESP32-S3 heap.
 /// `8192` is the first 4096 samples twice (the plan's A+A).
 const CEILINGS: &[(&str, usize, u32, usize)] = &[
     // (content, samples, level, max peak bytes)
-    ("quiet", 512, 0, usize::MAX),
-    ("quiet", 4096, 0, usize::MAX),
-    ("quiet", 8192, 0, usize::MAX),
-    ("quiet", 8192, 5, usize::MAX),
-    ("quiet", 8192, 8, usize::MAX),
-    ("quiet", 8000, 5, usize::MAX),
-    ("loud", 8192, 0, usize::MAX),
-    ("loud", 8192, 8, usize::MAX),
-    ("noise", 8192, 0, usize::MAX),
-    ("noise", 8192, 8, usize::MAX),
+    ("quiet", 512, 0, 37_888),
+    ("quiet", 4096, 0, 103_424),
+    ("quiet", 8192, 0, 123_904),
+    ("quiet", 8192, 5, 123_904),
+    ("quiet", 8192, 8, 123_904),
+    ("quiet", 8000, 5, 125_952),
+    ("loud", 8192, 0, 123_904),
+    ("loud", 8192, 8, 123_904),
+    ("noise", 8192, 0, 140_288),
+    ("noise", 8192, 8, 140_288),
 ];
 
 #[test]
