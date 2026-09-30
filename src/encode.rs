@@ -131,6 +131,9 @@ pub struct Encoder {
     chans: Vec<Vec<i32>>,
     stats: EncodeStats,
     scratch: EncodeScratch,
+    /// LPC windows for the last block size seen; kept across streams by
+    /// [`Encoder::finish_and_reset`].
+    wins: WindowCache,
 }
 
 impl Encoder {
@@ -155,6 +158,7 @@ impl Encoder {
             chans: vec![Vec::new(); channels as usize],
             stats: EncodeStats::default(),
             scratch: EncodeScratch::default(),
+            wins: WindowCache::default(),
         })
     }
 
@@ -289,6 +293,24 @@ impl Encoder {
         (out, stats)
     }
 
+    /// Encode all buffered samples into a complete FLAC stream, then start the
+    /// next stream on this same encoder (same format and level, counters
+    /// reset). The output is byte-identical to [`Encoder::finish`] on a fresh
+    /// encoder; what carries over is memory: the sample and analysis buffers
+    /// keep their capacity, and the LPC windows of a short final block are
+    /// kept, so a caller that closes a stream per chunk stops rebuilding them
+    /// (`libm::cos` per taper sample — a soft-float call on chips without an
+    /// f64 FPU) and stops re-allocating its scratch on every chunk. The price
+    /// is that those buffers stay allocated between chunks.
+    pub fn finish_and_reset(&mut self) -> Vec<u8> {
+        let out = self.encode_stream();
+        for chan in &mut self.chans {
+            chan.clear();
+        }
+        self.stats = EncodeStats::default();
+        out
+    }
+
     /// MD5 of the unencoded audio: interleaved samples, little-endian, at the
     /// coded bit depth — FLAC's STREAMINFO integrity signature.
     fn compute_md5(&self) -> [u8; 16] {
@@ -361,7 +383,7 @@ impl Encoder {
         let (mut min_fs, mut max_fs) = (u32::MAX, 0u32);
         let mut frame_number = 0u64;
         let mut start = 0usize;
-        let mut wins = WindowCache::default();
+        let mut wins = core::mem::take(&mut self.wins);
         // One frame writer, reused (cleared) for every frame instead of a
         // fresh allocation per frame. Sized to the raw ceiling of the largest
         // (first) block — blocks are non-increasing, and a lossless frame
@@ -381,6 +403,7 @@ impl Encoder {
             frame_number += 1;
             self.stats.frames += 1;
         }
+        self.wins = wins;
         if frames.is_empty() {
             min_fs = 0;
             max_fs = 0;
@@ -2180,6 +2203,35 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// A reused encoder produces exactly the streams fresh encoders do, chunk
+    /// after chunk, across block-size changes (full, short tail, full again,
+    /// a different tail, a stream shorter than one block).
+    #[test]
+    fn finish_and_reset_matches_fresh_encoders() {
+        for &(ch, level) in &[(1u32, 0u32), (1, 8), (2, 5)] {
+            let mut reused = Encoder::new(16000, ch, 16).unwrap();
+            reused.set_compression_level(level);
+            for (k, &n) in [8000usize, 8192, 3904, 8000, 100, 12345, 8000]
+                .iter()
+                .enumerate()
+            {
+                let x: Vec<i32> = (0..n * ch as usize)
+                    .map(|i| (((i * 7919 + k * 104729) % 2003) as i32 - 1001) * 13)
+                    .collect();
+                let mut fresh = Encoder::new(16000, ch, 16).unwrap();
+                fresh.set_compression_level(level);
+                fresh.push_interleaved(&x).unwrap();
+                let want = fresh.finish();
+                reused.push_interleaved(&x).unwrap();
+                assert_eq!(
+                    reused.finish_and_reset(),
+                    want,
+                    "ch={ch} level={level} chunk={k} n={n}"
+                );
             }
         }
     }
