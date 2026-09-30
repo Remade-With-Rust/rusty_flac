@@ -1243,13 +1243,40 @@ fn autocorr_int(w: &[u64], out: &mut [i64]) {
 
 /// Scalar lag sums: a sign-extended 32×32→64 multiply and a 64-bit add per
 /// term (native `mull`/`mulsh` on Xtensa, no libcall).
+///
+/// Lags go in pairs: one load of `x[i]` serves both, and the `x[i + lag + 1]`
+/// loaded for the second lag is carried into the next step as the first
+/// lag's `x[i + 1 + lag]` — two loads per two multiply-adds instead of four.
+/// Integer sums, so the pairing cannot change a result.
 fn autocorr_int_scalar(w: &[u64], out: &mut [i64]) {
     let n = w.len();
-    for (lag, o) in out.iter_mut().enumerate() {
-        *o = w[..n - lag]
+    // Carried values stay i32 and widen only at the multiply: an i64 carried
+    // across iterations loses its sign-extension and becomes a full 64×64
+    // multiply (measured +1,491,164 instructions over the bench rows).
+    let x = |v: u64| v as i32;
+    let mul = |a: i32, b: i32| a as i64 * b as i64;
+    let mut lag = 0;
+    while lag + 2 <= out.len() {
+        // Lag + 1 covers i in 0..m; lag covers one more, i = m.
+        let m = n - lag - 1;
+        let (mut a0, mut a1) = (0i64, 0i64);
+        let mut cur = x(w[lag]);
+        for (&xi, &next) in w[..m].iter().zip(&w[lag + 1..]) {
+            let (xi, next) = (x(xi), x(next));
+            a0 += mul(xi, cur);
+            a1 += mul(xi, next);
+            cur = next;
+        }
+        a0 += mul(x(w[m]), cur);
+        out[lag] = a0;
+        out[lag + 1] = a1;
+        lag += 2;
+    }
+    if lag < out.len() {
+        out[lag] = w[..n - lag]
             .iter()
             .zip(&w[lag..])
-            .map(|(&a, &b)| (a as i32 as i64) * (b as i32 as i64))
+            .map(|(&a, &b)| mul(x(a), x(b)))
             .sum();
     }
 }
@@ -2656,6 +2683,33 @@ mod tests {
             on_i32_path > 20 && checked - on_i32_path > 20,
             "{on_i32_path} of {checked} on the i32 path"
         );
+    }
+
+    /// The paired-lag scalar kernel equals the per-lag definition for every
+    /// lag count (odd counts take the single-lag tail) and short blocks.
+    #[test]
+    fn autocorr_int_scalar_matches_definition() {
+        let mut x = 7u64;
+        for n in [2usize, 3, 13, 14, 100, 4096] {
+            let w: Vec<u64> = (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(11);
+                    (((x >> 32) as i32) >> 7) as i64 as u64
+                })
+                .collect();
+            for lags in 1..=13.min(n) {
+                let want: Vec<i64> = (0..lags)
+                    .map(|l| {
+                        (0..n - l)
+                            .map(|i| w[i] as i32 as i64 * w[i + l] as i32 as i64)
+                            .sum()
+                    })
+                    .collect();
+                let mut got = vec![0i64; lags];
+                autocorr_int_scalar(&w, &mut got);
+                assert_eq!(got, want, "n={n} lags={lags}");
+            }
+        }
     }
 
     /// The generated `BLOCK_SIZE` table is `tukey_tapers`, value for value — on
