@@ -966,7 +966,11 @@ fn write_rice(bw: &mut BitWriter, v: i32, k: u32) {
     let u = zigzag(v);
     let q = u >> k;
     let total = q + 1 + k;
-    if total <= 56 {
+    if total <= BitWriter::SHORT {
+        // The common case (k ~ 5-10, q ~ 0-3): the whole codeword and the
+        // writer's pending bits fit 32 bits.
+        bw.write_bits_short((1u32 << k) | (u & ((1u32 << k) - 1)), total);
+    } else if total <= 56 {
         let low = (u as u64) & ((1u64 << k) - 1);
         bw.write_bits((1u64 << k) | low, total);
     } else {
