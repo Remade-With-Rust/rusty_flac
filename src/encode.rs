@@ -579,19 +579,30 @@ impl Tapers {
 /// its own tapers.
 #[derive(Default)]
 struct WindowCache {
+    /// Block size the windows are currently for.
     n: usize,
     full: bool,
+    /// Block size `short` was built for (0: none). Kept apart from `n`, so a
+    /// stream's full blocks do not evict its short tail's tapers — the next
+    /// stream of the same length reuses them.
+    short_n: usize,
     short: [Tapers; 2],
+    /// Taper builds, for the reuse test: a cache that misses is otherwise
+    /// invisible, the output being byte-identical either way.
+    #[cfg(test)]
+    builds: usize,
 }
 
 impl WindowCache {
     fn ensure(&mut self, n: usize) {
-        if self.n == n {
-            return;
-        }
         self.n = n;
         self.full = n == BLOCK_SIZE;
-        if !self.full {
+        if !self.full && self.short_n != n {
+            self.short_n = n;
+            #[cfg(test)]
+            {
+                self.builds += 1;
+            }
             for (slot, &alpha) in self.short.iter_mut().zip(&WINDOW_ALPHAS) {
                 *slot = tukey_tapers(n, alpha);
             }
@@ -2227,11 +2238,17 @@ mod tests {
                 fresh.push_interleaved(&x).unwrap();
                 let want = fresh.finish();
                 reused.push_interleaved(&x).unwrap();
+                let builds = reused.wins.builds;
                 assert_eq!(
                     reused.finish_and_reset(),
                     want,
                     "ch={ch} level={level} chunk={k} n={n}"
                 );
+                // Chunk 3 (8000 = 4096 + a 3904 tail) follows chunk 2 (3904):
+                // its tail's tapers must come from the cache.
+                if k == 3 {
+                    assert_eq!(reused.wins.builds, builds, "tail tapers rebuilt");
+                }
             }
         }
     }
