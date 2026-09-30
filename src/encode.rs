@@ -1165,7 +1165,12 @@ fn regrow(buf: &mut Vec<u64>, len: usize) {
 /// multiply-add is a 32×32→64 multiply and an add instead of two soft-float
 /// calls (the stage was 57–78 % of an ESP32-S3 encode;
 /// docs/plans/esp32-encoder-cost.md item 2).
-fn autocorrelation(samples: &[i32], max_order: usize, win: Window, scratch: &mut EncodeScratch) {
+fn autocorrelation(
+    samples: &[i32],
+    max_order: usize,
+    win: Window,
+    scratch: &mut EncodeScratch,
+) -> u32 {
     // Windowed samples and the autocorrelation output are both encoder-owned
     // buffers, reused across every subframe analysis. Result in
     // `scratch.autoc`.
@@ -1213,6 +1218,7 @@ fn autocorrelation(samples: &[i32], max_order: usize, win: Window, scratch: &mut
     let autoc = &mut scratch.autoc;
     autoc.clear();
     autoc.extend(sums.iter().map(|&v| v as f64 * scale));
+    big
 }
 
 /// `2^e` as an f64, exactly (normal range only).
@@ -1407,7 +1413,7 @@ fn quantize_lpc(lpc: &[f64], precision: u32) -> Option<(Vec<i32>, i32)> {
 /// sum of ≤32 terms is < 2^44 — integers well inside f64's exact range, so
 /// FMA ordering cannot change a bit, and `floor(sum · 2^-shift)` equals the
 /// arithmetic shift (gated by `lpc_residual_avx2_matches_scalar`).
-fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize) -> Vec<i32> {
+fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize, peak: u32) -> Vec<i32> {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         // Exactness guard: the vector path converts the prediction to i32
@@ -1425,7 +1431,7 @@ fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize) -> Vec<i
             return unsafe { lpc_residual_avx2(samples, qlp, shift, order) };
         }
     }
-    lpc_residual_scalar(samples, qlp, shift, order)
+    lpc_residual_scalar(samples, qlp, shift, order, peak)
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -1467,7 +1473,15 @@ unsafe fn lpc_residual_avx2(samples: &[i32], qlp: &[i32], shift: i32, order: usi
     res
 }
 
-fn lpc_residual_scalar(samples: &[i32], qlp: &[i32], shift: i32, order: usize) -> Vec<i32> {
+/// `peak` is the OR of `|s|` over `samples` (its bit length bounds every
+/// sample), as [`autocorrelation`] returns it for the same samples.
+fn lpc_residual_scalar(
+    samples: &[i32],
+    qlp: &[i32],
+    shift: i32,
+    order: usize,
+    peak: u32,
+) -> Vec<i32> {
     #[inline(always)]
     fn run<const ORDER: usize>(samples: &[i32], qlp: &[i32], shift: i32) -> Vec<i32> {
         let mut res = Vec::with_capacity(samples.len() - ORDER);
@@ -1483,6 +1497,56 @@ fn lpc_residual_scalar(samples: &[i32], qlp: &[i32], shift: i32, order: usize) -
             res.push(samples[i] - (sum >> shift) as i32);
         }
         res
+    }
+    // 32-bit prediction when it provably cannot overflow: every partial sum
+    // is bounded by Σ|c|·max|s| < Σ|c|·2^bits(max|s|). When that is below
+    // 2^31 the i32 sum equals the i64 one, and so does `sum >> shift` — on a
+    // 32-bit core one multiply and one add per tap instead of a widening
+    // multiply pair and a 64-bit add with carry. (libFLAC makes the same
+    // 32/64-bit split, from bit depths; this one uses the block's own peak,
+    // which the autocorrelation already measured — no extra pass.)
+    debug_assert_eq!(peak, samples.iter().fold(0, |a, &s| a | s.unsigned_abs()));
+    let sum_abs: u64 = qlp[..order].iter().map(|&c| c.unsigned_abs() as u64).sum();
+    if sum_abs << (u32::BITS - peak.leading_zeros()) < 1u64 << 31 {
+        #[inline(always)]
+        fn run32<const ORDER: usize>(samples: &[i32], qlp: &[i32], shift: i32) -> Vec<i32> {
+            let mut res = Vec::with_capacity(samples.len() - ORDER);
+            let mut coeffs = [0i32; 32];
+            coeffs[..ORDER].copy_from_slice(&qlp[..ORDER]);
+            for i in ORDER..samples.len() {
+                let mut sum: i32 = 0;
+                for j in 0..ORDER {
+                    sum += coeffs[j] * samples[i - 1 - j];
+                }
+                res.push(samples[i] - (sum >> shift));
+            }
+            res
+        }
+        return match order {
+            1 => run32::<1>(samples, qlp, shift),
+            2 => run32::<2>(samples, qlp, shift),
+            3 => run32::<3>(samples, qlp, shift),
+            4 => run32::<4>(samples, qlp, shift),
+            5 => run32::<5>(samples, qlp, shift),
+            6 => run32::<6>(samples, qlp, shift),
+            7 => run32::<7>(samples, qlp, shift),
+            8 => run32::<8>(samples, qlp, shift),
+            9 => run32::<9>(samples, qlp, shift),
+            10 => run32::<10>(samples, qlp, shift),
+            11 => run32::<11>(samples, qlp, shift),
+            12 => run32::<12>(samples, qlp, shift),
+            _ => {
+                let mut res = Vec::with_capacity(samples.len() - order);
+                for i in order..samples.len() {
+                    let mut sum: i32 = 0;
+                    for j in 0..order {
+                        sum += qlp[j] * samples[i - 1 - j];
+                    }
+                    res.push(samples[i] - (sum >> shift));
+                }
+                res
+            }
+        };
     }
     match order {
         1 => run::<1>(samples, qlp, shift),
@@ -1528,6 +1592,9 @@ struct LpcEstimate {
     order: usize,
     coeffs: Vec<f64>,
     est_bits: f64,
+    /// OR of `|s|` over the samples this estimate describes (from the
+    /// autocorrelation), for the residual's 32-bit bound.
+    peak: u32,
 }
 
 /// When two windows' estimates are within this relative margin, both are
@@ -1586,7 +1653,7 @@ fn lpc_estimate(
     scratch: &mut EncodeScratch,
 ) -> Option<LpcEstimate> {
     let n = samples.len();
-    autocorrelation(samples, max_order, win, &mut *scratch);
+    let peak = autocorrelation(samples, max_order, win, &mut *scratch);
     let autoc = &scratch.autoc;
     if autoc[0] <= 0.0 {
         return None;
@@ -1622,6 +1689,7 @@ fn lpc_estimate(
         order: best_idx + 1,
         coeffs,
         est_bits: best_est,
+        peak,
     })
 }
 
@@ -1639,7 +1707,7 @@ fn realize_lpc(
         stats.lpc_quantize_failed += 1;
         return None;
     };
-    let res = lpc_residual(samples, &qlp, shift, order);
+    let res = lpc_residual(samples, &qlp, shift, order, est.peak);
     let plan = plan_partitions(&res, n, order, scratch);
     // hdr(8) + warm-up + precision(4) + shift(5) + coeffs + residual hdr(6) + body.
     let bits =
@@ -2532,6 +2600,64 @@ mod tests {
         }
     }
 
+    /// The 32-bit LPC residual path equals the 64-bit one wherever its bound
+    /// admits it — including right at the bound — and the bound refuses the
+    /// cases that would overflow.
+    #[test]
+    fn lpc_residual_i32_path_matches_i64() {
+        // The i64 reference, or None when a residual would not fit i32 (a
+        // predictor the encoder never produces; the i64 path overflows there
+        // too).
+        let reference = |s: &[i32], q: &[i32], shift: i32| -> Option<Vec<i32>> {
+            (q.len()..s.len())
+                .map(|i| {
+                    let sum: i64 = (0..q.len())
+                        .map(|j| q[j] as i64 * s[i - 1 - j] as i64)
+                        .sum();
+                    i32::try_from(s[i] as i64 - (sum >> shift)).ok()
+                })
+                .collect()
+        };
+        let mut x = 5u64;
+        let mut rnd = move |m: i64| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 20) as i64 % (2 * m + 1)) - m
+        };
+        let (mut checked, mut on_i32_path) = (0u32, 0u32);
+        for order in 1..=14usize {
+            for &(amp, cmax) in &[
+                (300i64, 9000i64),
+                (32767, 16383),
+                (32767, 1 << 14),
+                ((1 << 24) - 1, 16383),
+            ] {
+                let s: Vec<i32> = (0..777).map(|_| rnd(amp) as i32).collect();
+                let q: Vec<i32> = (0..order).map(|_| rnd(cmax) as i32).collect();
+                for shift in [0, 9, 14, 15] {
+                    let Some(want) = reference(&s, &q, shift) else {
+                        continue;
+                    };
+                    let big = s.iter().fold(0u32, |a, &v| a | v.unsigned_abs());
+                    let sum_abs: u64 = q.iter().map(|&c| c.unsigned_abs() as u64).sum();
+                    on_i32_path += (sum_abs << (32 - big.leading_zeros()) < 1u64 << 31) as u32;
+                    checked += 1;
+                    assert_eq!(
+                        lpc_residual_scalar(&s, &q, shift, order, big),
+                        want,
+                        "order={order} amp={amp} cmax={cmax} shift={shift}"
+                    );
+                }
+            }
+        }
+        // Both paths were exercised.
+        assert!(
+            on_i32_path > 20 && checked - on_i32_path > 20,
+            "{on_i32_path} of {checked} on the i32 path"
+        );
+    }
+
     /// The generated `BLOCK_SIZE` table is `tukey_tapers`, value for value — on
     /// `libm` builds by construction (it is generated with `libm::cos`), and on
     /// platform-libm builds because a last-bit difference in `cos` does not
@@ -2895,7 +3021,8 @@ mod tests {
                 // Same exactness precondition the dispatcher enforces.
                 let sum_abs: i64 = qlp.iter().map(|&c| (c as i64).abs()).sum();
                 assert!((sum_abs << 25) >> shift < (1i64 << 31), "test setup");
-                let a = lpc_residual_scalar(&samples, &qlp, shift, order);
+                let peak = samples.iter().fold(0, |a: u32, &s| a | s.unsigned_abs());
+                let a = lpc_residual_scalar(&samples, &qlp, shift, order, peak);
                 let b = unsafe { lpc_residual_avx2(&samples, &qlp, shift, order) };
                 assert_eq!(a, b, "order={order} shift={shift}");
             }
