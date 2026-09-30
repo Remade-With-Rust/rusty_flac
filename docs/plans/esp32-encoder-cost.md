@@ -305,3 +305,29 @@ The chip numbers came from a scratch firmware: the §6 firmware's profile,
 esp-alloc without `global-allocator` behind a counting wrapper, and fixed
 PCM through `include_bytes!`. That firmware lives outside this repo. On the
 Janus firmware itself, rerun §6 against this commit.
+
+### 7.6 Addendum — five instruction-count wins (same day, `1f21eac`..`8849786`)
+
+These were measured with the LX7 performance monitor's retired-instruction
+counter (event 2, mask 0x8DFF, level-0 only) instead of time. The counter
+gives the same number to the instruction across repeats. Every change is
+byte-identical: the stream digest is unchanged, and output bytes and FNV
+are checked on every row. All ten bench rows (quiet, loud and stereo at
+levels 0/5/8, plus the 8,000-sample tail rows) went down on every one.
+
+| commit | change | instructions, 10 rows |
+|---|---|---:|
+| `1f21eac` | Rice-sum rows unrolled per width (registers, immediate shifts) | −9,163,710 |
+| `b111630` | fixed-order sums as one register sliding window | −6,280,096 |
+| `d417e6b` | 32-bit LPC residual when the block's peak proves it exact | −1,707,842 |
+| `352aaca` | paired-lag scalar autocorrelation | −1,210,040 |
+| `8849786` | 32-bit bit-writer path for Rice codewords ≤ 24 bits | −1,401,981 |
+| | **total** | **89,602,261 → 69,838,592 (−22.1 %)** |
+
+A quiet 4,096-sample L0 block is now 2.57 M instructions, down from 3.71 M,
+with cycles down 30.7 %. The host (AVX2 paths) is unchanged: 8/16 paired
+wins, z = 0. Three probes were refuted along the way, and their numbers are
+in the commit bodies:
+- const-generic Rice widths: +278,104 (opt-level `s` kept the loop);
+- a `collect()`-built residual: +305,651;
+- an i64-carried autocorrelation operand: +1,491,164.
