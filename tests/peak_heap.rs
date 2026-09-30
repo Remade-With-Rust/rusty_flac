@@ -108,22 +108,36 @@ fn on_free(p: usize, size: usize) {
 #[global_allocator]
 static A: Counting = Counting;
 
-/// Quiet-room microphone stand-in: coloured noise near −40 dBFS with a slow
-/// hum, deterministic. The chip's capture is not in the tree; the peak is
-/// mostly shape-driven (block sizes, LPC order), so this is representative.
-fn quiet_room(n: usize, seed: u64) -> Vec<u8> {
+/// Deterministic 16 kHz mono s16 content, three classes:
+/// - `quiet`: the plan's quiet-room microphone (coloured noise near −40 dBFS
+///   plus a 50 Hz hum);
+/// - `loud`: three tones and coloured noise near −6 dBFS (music-like);
+/// - `noise`: full-scale white noise, the worst case for residual size and
+///   so for the Rice-sum rows.
+///
+/// The chip bench encodes the same formulas, so host and chip rows compare.
+fn content(class: &str, n: usize, seed: u64) -> Vec<u8> {
     let mut s = seed;
     let mut lp = 0.0f64;
     let mut out = Vec::with_capacity(n * 2);
+    let tone = |i: usize, hz: f64| (i as f64 * 2.0 * std::f64::consts::PI * hz / 16000.0).sin();
     for i in 0..n {
         s = s
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         let white = ((s >> 33) as f64 / (1u64 << 31) as f64) - 0.5;
         lp = 0.9 * lp + 0.1 * white;
-        let hum = (i as f64 * 2.0 * std::f64::consts::PI * 50.0 / 16000.0).sin();
-        let v = (lp * 2600.0 + hum * 120.0) as i16;
-        out.extend_from_slice(&v.to_le_bytes());
+        let v = match class {
+            "quiet" => lp * 2600.0 + tone(i, 50.0) * 120.0,
+            "loud" => {
+                tone(i, 220.0) * 6000.0
+                    + tone(i, 331.0) * 4000.0
+                    + tone(i, 1250.0) * 1500.0
+                    + lp * 9000.0
+            }
+            _ => white * 65535.0,
+        };
+        out.extend_from_slice(&(v.clamp(-32768.0, 32767.0) as i16).to_le_bytes());
     }
     out
 }
@@ -162,40 +176,46 @@ fn dump(pcm: &[u8], level: u32) {
     );
 }
 
-/// Ceilings, bytes, for the chip's shape. Set from the measured values with
-/// a small margin so a regression of one block-sized buffer (8 KB of i32 at
-/// 2048 samples, or more) fails.
-const CEILINGS: &[(usize, u32, usize)] = &[
-    // (samples, level, max peak bytes)
-    (512, 0, usize::MAX),
-    (4096, 0, usize::MAX),
-    (8192, 0, usize::MAX),
-    (8192, 5, usize::MAX),
-    (8192, 8, usize::MAX),
-    (8000, 5, usize::MAX),
+/// Ceilings, bytes, for the chip's shape: the measured peak rounded up to
+/// the next KiB, so any regression of a block-sized buffer fails.
+/// `8192` is the first 4096 samples twice (the plan's A+A).
+const CEILINGS: &[(&str, usize, u32, usize)] = &[
+    // (content, samples, level, max peak bytes)
+    ("quiet", 512, 0, usize::MAX),
+    ("quiet", 4096, 0, usize::MAX),
+    ("quiet", 8192, 0, usize::MAX),
+    ("quiet", 8192, 5, usize::MAX),
+    ("quiet", 8192, 8, usize::MAX),
+    ("quiet", 8000, 5, usize::MAX),
+    ("loud", 8192, 0, usize::MAX),
+    ("loud", 8192, 8, usize::MAX),
+    ("noise", 8192, 0, usize::MAX),
+    ("noise", 8192, 8, usize::MAX),
 ];
 
 #[test]
 fn encoder_peak_heap_per_stream() {
-    let a = quiet_room(4096, 7);
-    let mut aa = a.clone();
-    aa.extend_from_slice(&a);
-    let long = quiet_room(8000, 7);
     let mut failed = Vec::new();
-    println!("samples level peak_bytes flac_bytes");
-    for &(n, level, ceiling) in CEILINGS {
-        let pcm: &[u8] = match n {
-            8192 => &aa,
-            8000 => &long,
-            _ => &a[..n * 2],
+    println!("content samples level peak_bytes flac_bytes");
+    for &(class, n, level, ceiling) in CEILINGS {
+        let seed = match class {
+            "quiet" => 7,
+            "loud" => 9,
+            _ => 11,
         };
-        let (peak, len) = peak_of(pcm, level);
-        println!("{n:>7} {level:>5} {peak:>10} {len:>10}");
+        let pcm = if n == 8192 {
+            let a = content(class, 4096, seed);
+            [a.clone(), a].concat()
+        } else {
+            content(class, n, seed)
+        };
+        let (peak, len) = peak_of(&pcm, level);
+        println!("{class:>7} {n:>7} {level:>5} {peak:>10} {len:>10}");
         if peak > ceiling {
-            failed.push((n, level, peak, ceiling));
+            failed.push((class, n, level, peak, ceiling));
         }
         if std::env::var_os("RUSTY_FLAC_PEAK_DUMP").is_some() {
-            dump(pcm, level);
+            dump(&pcm, level);
         }
     }
     assert!(failed.is_empty(), "peak-heap ceilings exceeded: {failed:?}");
