@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.2.0...v0.2.1) - 2026-10-08
+
+### Other
+
+- bump rusty_alloc-api to =2.2.5 ([#14](https://github.com/Remade-With-Rust/rusty_flac/pull/14))
+- 1,358 active installs
+
 ## [0.2.0](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.1.3...v0.2.0) - 2026-09-30
 
 Microcontroller release: the encoder on an ESP32-S3 (240 MHz, `no_std`) goes
