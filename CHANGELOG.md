@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.2.1...v0.2.2) - 2026-10-24
+
+### Other
+
+- *(decode)* 2.1-3.1x faster decode; faster than symphonia 0.5.5 on every file
+- 2,081 active installs
+- bump rusty_alloc-api to =2.2.6 ([#16](https://github.com/Remade-With-Rust/rusty_flac/pull/16))
+- Merge branch 'main' into chore/release-plz-0-5-139
+- 1,548 active installs
+
 ## [0.2.1](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.2.0...v0.2.1) - 2026-10-08
 
 ### Other
