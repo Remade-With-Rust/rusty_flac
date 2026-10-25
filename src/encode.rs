@@ -20,9 +20,12 @@ use crate::bitio::BitWriter;
 use crate::crc::{crc16, crc8};
 use crate::math;
 
-/// Nominal samples-per-channel per FLAC frame. 4096 is FLAC's usual default and
-/// encodes as an explicit 16-bit block size (frame-header block-size code 7).
+/// Default samples-per-channel per FLAC frame, changed by
+/// [`Encoder::set_block_size`]. 4096 is FLAC's usual default; every size is
+/// encoded as an explicit 16-bit block size (frame-header block-size code 7).
 const BLOCK_SIZE: usize = 4096;
+/// The block sizes FLAC allows (STREAMINFO's minimum is 16).
+const BLOCK_SIZES: core::ops::RangeInclusive<u32> = 16..=65535;
 /// Quantized LPC coefficient precision in bits.
 const LPC_PRECISION: u32 = 14;
 /// Highest LPC order searched — subset-compliant.
@@ -52,6 +55,8 @@ pub enum EncodeError {
     BadSampleRate(u32),
     /// push_interleaved got a slice whose length is not a channel multiple.
     RaggedInput,
+    /// Block size outside FLAC's 16..=65535.
+    BadBlockSize(u32),
 }
 
 impl core::fmt::Display for EncodeError {
@@ -64,6 +69,7 @@ impl core::fmt::Display for EncodeError {
             EncodeError::RaggedInput => {
                 write!(f, "flac: interleaved length not a channel multiple")
             }
+            EncodeError::BadBlockSize(b) => write!(f, "flac: bad block size {b}"),
         }
     }
 }
@@ -128,6 +134,7 @@ pub struct Encoder {
     channels: usize,
     bps: u32,
     max_lpc_order: usize,
+    block_size: usize,
     chans: Vec<Vec<i32>>,
     stats: EncodeStats,
     scratch: EncodeScratch,
@@ -155,6 +162,7 @@ impl Encoder {
             channels: channels as usize,
             bps: bits_per_sample,
             max_lpc_order: LPC_MAX_ORDER,
+            block_size: BLOCK_SIZE,
             chans: vec![Vec::new(); channels as usize],
             stats: EncodeStats::default(),
             scratch: EncodeScratch::default(),
@@ -172,6 +180,19 @@ impl Encoder {
         } else {
             12
         };
+    }
+
+    /// Samples per channel in every frame but the last, `16..=65535`
+    /// (default 4096). Sizes above 4608 leave FLAC's streamable subset. Only
+    /// 4096 reads its LPC windows from a static table; any other size builds
+    /// them once and keeps them, across streams too with
+    /// [`Encoder::finish_and_reset`].
+    pub fn set_block_size(&mut self, block_size: u32) -> Result<(), EncodeError> {
+        if !BLOCK_SIZES.contains(&block_size) {
+            return Err(EncodeError::BadBlockSize(block_size));
+        }
+        self.block_size = block_size as usize;
+        Ok(())
     }
 
     /// Append interleaved samples (len must be a channel multiple).
@@ -388,11 +409,11 @@ impl Encoder {
         // fresh allocation per frame. Sized to the raw ceiling of the largest
         // (first) block — blocks are non-increasing, and a lossless frame
         // never exceeds raw — so it never reallocates.
-        let first_bs = n.min(BLOCK_SIZE);
+        let first_bs = n.min(self.block_size);
         let mut frame_bw =
             BitWriter::with_capacity(first_bs * self.channels * (bps as usize / 8) + 64);
         while start < n {
-            let bs = (n - start).min(BLOCK_SIZE);
+            let bs = (n - start).min(self.block_size);
             wins.ensure(bs);
             self.encode_frame(frame_number, start, bs, bps, &wins, &mut frame_bw);
             let flen = frame_bw.bytes().len() as u32;
@@ -416,10 +437,10 @@ impl Encoder {
 
         // STREAMINFO (34 bytes). Block sizes are the NOMINAL blocking (the
         // spec's min/max exclude the final short block, and requires >= 16 —
-        // a 5-sample stream still declares its nominal 4096, like libFLAC).
+        // a 5-sample stream still declares its nominal block size, like libFLAC).
         let mut si = BitWriter::with_capacity(34);
-        si.write_bits(BLOCK_SIZE as u64, 16);
-        si.write_bits(BLOCK_SIZE as u64, 16);
+        si.write_bits(self.block_size as u64, 16);
+        si.write_bits(self.block_size as u64, 16);
         si.write_bits(min_fs as u64, 24);
         si.write_bits(max_fs as u64, 24);
         si.write_bits(self.sample_rate as u64, 20);
@@ -576,9 +597,9 @@ impl Tapers {
     }
 }
 
-/// The windows for the current block size. A full [`BLOCK_SIZE`] block (every
-/// block but a stream's last) reads a static table; only a short final block
-/// builds its own tapers.
+/// The windows for the current block size. A [`BLOCK_SIZE`] block reads a
+/// static table; any other size (a stream's short final block, or every block
+/// at a block size set by [`Encoder::set_block_size`]) builds its own tapers.
 #[derive(Default)]
 struct WindowCache {
     /// Block size the windows are currently for.
@@ -2552,6 +2573,45 @@ mod tests {
                 if k == 3 {
                     assert_eq!(reused.wins.builds, builds, "tail tapers rebuilt");
                 }
+            }
+        }
+    }
+
+    /// A set block size frames the stream at that size — STREAMINFO and
+    /// every frame but a short last one — round-trips, and is kept by
+    /// `finish_and_reset`; sizes FLAC cannot express are refused.
+    #[test]
+    fn set_block_size_frames_the_stream() {
+        let mut enc = Encoder::new(44100, 2, 16).unwrap();
+        for bad in [0, 15, 65536] {
+            assert_eq!(enc.set_block_size(bad), Err(EncodeError::BadBlockSize(bad)));
+        }
+        enc.set_compression_level(8);
+        for bs in [16u32, 1176, 2352, 65535] {
+            enc.set_block_size(bs).unwrap();
+            for n in [3 * bs as usize, 3 * bs as usize + 5] {
+                let x: Vec<i32> = (0..n * 2)
+                    .map(|i| (((i * 7919) % 2003) as i32 - 1001) * 13)
+                    .collect();
+                enc.push_interleaved(&x).unwrap();
+                let stream = enc.finish_and_reset();
+                let mut dec = crate::decode::Decoder::new(&stream).unwrap();
+                let info = dec.streaminfo();
+                assert_eq!((info.min_block_size, info.max_block_size), (bs, bs));
+                let mut out = vec![Vec::new(), Vec::new()];
+                let mut sizes = Vec::new();
+                while let Some(size) = dec.next_frame(&mut out).unwrap() {
+                    sizes.push(size);
+                }
+                let tail = n % bs as usize;
+                let mut want = vec![bs as usize; n / bs as usize];
+                if tail != 0 {
+                    want.push(tail);
+                }
+                assert_eq!(sizes, want, "bs={bs} n={n}");
+                let left: Vec<i32> = x.iter().step_by(2).copied().collect();
+                let right: Vec<i32> = x.iter().skip(1).step_by(2).copied().collect();
+                assert_eq!(out, [left, right], "bs={bs} n={n}");
             }
         }
     }
