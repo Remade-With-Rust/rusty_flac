@@ -198,6 +198,17 @@ impl Encoder {
             return Ok(());
         }
         let n = samples.len() / ch;
+        if ch == 2 {
+            // Whole frames through `chunks_exact`, whose length is exact, so
+            // `extend` writes without a capacity check per sample; `step_by`
+            // over the flat slice is not, and walked it a sample at a time.
+            let [l, r] = &mut self.chans[..] else {
+                unreachable!("two channels")
+            };
+            l.extend(samples.chunks_exact(2).map(|f| f[0]));
+            r.extend(samples.chunks_exact(2).map(|f| f[1]));
+            return Ok(());
+        }
         for (c, chan) in self.chans.iter_mut().enumerate() {
             chan.reserve(n);
             chan.extend(samples[c..].iter().step_by(ch));
