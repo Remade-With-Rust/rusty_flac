@@ -1991,13 +1991,13 @@ fn realize_lpc(
 /// order-selection method). Returns the chosen order and its |residual| sum.
 /// Integer math, so the AVX2 kernel is exact (gated by
 /// `fixed_sums_avx2_matches_scalar`).
-fn fixed_order_estimate(samples: &[i32]) -> (usize, u64) {
+fn fixed_order_estimate(samples: &[i32], bps: u32) -> (usize, u64) {
     let n = samples.len();
     let max_order = 4.min(n.saturating_sub(1));
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     let sums = if n >= 16 && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: guarded by the runtime AVX2 check.
-        unsafe { fixed_sums_avx2(samples) }
+        unsafe { fixed_sums_avx2(samples, bps) }
     } else {
         fixed_sums_scalar(samples)
     };
@@ -2089,15 +2089,20 @@ fn fixed_sums_scalar(samples: &[i32]) -> [u64; 5] {
 /// order-4 coefficient sum 16 ⇒ every intermediate fits i32.
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx2")]
-unsafe fn fixed_sums_avx2(samples: &[i32]) -> [u64; 5] {
+unsafe fn fixed_sums_avx2(samples: &[i32], bps: u32) -> [u64; 5] {
     use core::arch::x86_64::*;
     let n = samples.len();
     debug_assert!(n >= 16);
 
+    // |residual| of order k is below 2^k * 2^(bps - 1), so order 4's is below
+    // 2^(bps + 3) and `m` of them sum inside a u32 lane when
+    // m <= 2^(29 - bps). The absolute values accumulate in u32 lanes -- two
+    // instructions per order per vector -- and widen to the u64 totals once
+    // per `m` vectors: every 8192 at 16-bit (never, within a block), every 32
+    // at 24. Widening every vector, as before, was six per order.
+    let m = 1usize << 29u32.saturating_sub(bps).min(20);
     #[inline(always)]
-    unsafe fn accum(acc: &mut __m256i, v: __m256i) {
-        // |i32| widened to 4+4 u64 lanes and added.
-        let a = _mm256_abs_epi32(v);
+    unsafe fn widen(acc: &mut __m256i, a: __m256i) {
         let lo = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(a));
         let hi = _mm256_cvtepu32_epi64(_mm256_extracti128_si256(a, 1));
         *acc = _mm256_add_epi64(*acc, _mm256_add_epi64(lo, hi));
@@ -2118,25 +2123,35 @@ unsafe fn fixed_sums_avx2(samples: &[i32]) -> [u64; 5] {
     let mut a4 = _mm256_setzero_si256();
     let mut i = 4usize;
     while i + 8 <= n {
-        let s0 = _mm256_loadu_si256(p.add(i) as *const __m256i);
-        let s1 = _mm256_loadu_si256(p.add(i - 1) as *const __m256i);
-        let s2 = _mm256_loadu_si256(p.add(i - 2) as *const __m256i);
-        let s3 = _mm256_loadu_si256(p.add(i - 3) as *const __m256i);
-        let s4 = _mm256_loadu_si256(p.add(i - 4) as *const __m256i);
-        let r1 = _mm256_sub_epi32(s0, s1);
-        let d1 = _mm256_sub_epi32(s1, s2); // r1 shifted one sample back
-        let r2 = _mm256_sub_epi32(r1, d1);
-        let d2 = _mm256_sub_epi32(d1, _mm256_sub_epi32(s2, s3)); // r2 shifted
-        let r3 = _mm256_sub_epi32(r2, d2);
-        let e2 = _mm256_sub_epi32(_mm256_sub_epi32(s2, s3), _mm256_sub_epi32(s3, s4));
-        let d3 = _mm256_sub_epi32(d2, e2); // r3 shifted
-        let r4 = _mm256_sub_epi32(r3, d3);
-        accum(&mut a0, s0);
-        accum(&mut a1, r1);
-        accum(&mut a2, r2);
-        accum(&mut a3, r3);
-        accum(&mut a4, r4);
-        i += 8;
+        let mut b = [_mm256_setzero_si256(); 5];
+        let mut cnt = 0usize;
+        while cnt < m && i + 8 <= n {
+            let s0 = _mm256_loadu_si256(p.add(i) as *const __m256i);
+            let s1 = _mm256_loadu_si256(p.add(i - 1) as *const __m256i);
+            let s2 = _mm256_loadu_si256(p.add(i - 2) as *const __m256i);
+            let s3 = _mm256_loadu_si256(p.add(i - 3) as *const __m256i);
+            let s4 = _mm256_loadu_si256(p.add(i - 4) as *const __m256i);
+            let r1 = _mm256_sub_epi32(s0, s1);
+            let d1 = _mm256_sub_epi32(s1, s2); // r1 shifted one sample back
+            let r2 = _mm256_sub_epi32(r1, d1);
+            let d2 = _mm256_sub_epi32(d1, _mm256_sub_epi32(s2, s3)); // r2 shifted
+            let r3 = _mm256_sub_epi32(r2, d2);
+            let e2 = _mm256_sub_epi32(_mm256_sub_epi32(s2, s3), _mm256_sub_epi32(s3, s4));
+            let d3 = _mm256_sub_epi32(d2, e2); // r3 shifted
+            let r4 = _mm256_sub_epi32(r3, d3);
+            b[0] = _mm256_add_epi32(b[0], _mm256_abs_epi32(s0));
+            b[1] = _mm256_add_epi32(b[1], _mm256_abs_epi32(r1));
+            b[2] = _mm256_add_epi32(b[2], _mm256_abs_epi32(r2));
+            b[3] = _mm256_add_epi32(b[3], _mm256_abs_epi32(r3));
+            b[4] = _mm256_add_epi32(b[4], _mm256_abs_epi32(r4));
+            i += 8;
+            cnt += 1;
+        }
+        widen(&mut a0, b[0]);
+        widen(&mut a1, b[1]);
+        widen(&mut a2, b[2]);
+        widen(&mut a3, b[3]);
+        widen(&mut a4, b[4]);
     }
     let mut sums = [hsum(a0), hsum(a1), hsum(a2), hsum(a3), hsum(a4)];
 
@@ -2386,7 +2401,7 @@ fn estimate_arm(
     let est_bits = if lpc_est.is_finite() {
         (lpc_est as u64).min(verbatim)
     } else {
-        let (fx_order, fx_abs) = fixed_order_estimate(samples);
+        let (fx_order, fx_abs) = fixed_order_estimate(samples, bps);
         let fx_est = 8
             + fx_order as u64 * bps as u64
             + 6
@@ -2450,7 +2465,7 @@ fn realize_arm(
     // LPC candidate (a wide 10% margin — partitioning can undercut the
     // single-partition estimate). LPC wins ~99.6% of real subframes, so this
     // skips the second-most-expensive per-arm stage almost always.
-    let (fx_order, fx_abs) = fixed_order_estimate(samples);
+    let (fx_order, fx_abs) = fixed_order_estimate(samples, bps);
     let fx_est =
         8 + fx_order as u64 * bps as u64 + 6 + rice_bits_estimate(fx_abs, (n - fx_order) as u64);
     let fixed = if lpc.is_none() || fx_est <= lpc_bits.saturating_add(lpc_bits / 10) {
@@ -3325,19 +3340,31 @@ mod tests {
             return;
         }
         let mut x = 17u64;
-        for n in [16usize, 17, 23, 64, 4095, 4096] {
-            let s: Vec<i32> = (0..n)
-                .map(|_| {
-                    x = x.wrapping_mul(6364136223846793005).wrapping_add(3);
-                    ((x >> 33) as i32) >> ((x >> 59) & 7) // ±2^30-ish range
-                })
-                .map(|v| v.clamp(-(1 << 24), (1 << 24) - 1)) // 25-bit domain
-                .collect();
-            assert_eq!(
-                fixed_sums_scalar(&s),
-                unsafe { fixed_sums_avx2(&s) },
-                "n={n}"
-            );
+        // Each depth's full-scale domain, including alternating extremes --
+        // the worst case for the u32 lane sums between widenings.
+        for bps in [16u32, 17, 24, 25] {
+            let top = 1i32 << (bps - 1);
+            for n in [16usize, 17, 23, 64, 4095, 4096] {
+                let s: Vec<i32> = (0..n)
+                    .map(|i| {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(3);
+                        if x >> 62 == 0 {
+                            if i % 2 == 0 {
+                                top - 1
+                            } else {
+                                -top
+                            }
+                        } else {
+                            (((x >> 33) as i32) >> ((x >> 59) & 7)).clamp(-top, top - 1)
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    fixed_sums_scalar(&s),
+                    unsafe { fixed_sums_avx2(&s, bps) },
+                    "bps={bps} n={n}"
+                );
+            }
         }
     }
 
