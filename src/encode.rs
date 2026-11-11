@@ -1044,7 +1044,7 @@ unsafe fn rice_sums_avx2(res: &[i32]) -> [u64; RICE_KMAX + 1] {
 fn best_k_from_sums(sums: &[u64], cnt: u64, kmax: usize) -> (u32, u64) {
     let top = kmax.min(sums.len() - 1);
     let cost = |k: usize| sums[k] + cnt * (1 + k as u64);
-    let mean = if cnt > 0 { sums[0] / cnt } else { 0 };
+    let mean = sums[0].checked_div(cnt).unwrap_or(0);
     let mut k = ((u64::BITS - mean.leading_zeros()) as usize)
         .saturating_sub(1)
         .min(top);
@@ -2073,7 +2073,10 @@ fn fixed_order_estimate(samples: &[i32], bps: u32) -> (usize, u64) {
         fixed_sums_scalar(samples)
     };
     #[cfg(not(all(target_arch = "x86_64", feature = "std")))]
-    let sums = fixed_sums_scalar(samples);
+    let sums = {
+        let _ = bps; // only the AVX2 kernel's lane-width schedule reads it
+        fixed_sums_scalar(samples)
+    };
 
     let mut best = 0usize;
     for order in 1..=max_order {

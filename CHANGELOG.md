@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.2.2...v0.3.0) - 2026-11-11
+
+Speed and compression release. Every speed change is byte-identical (pinned
+`stream_identity` digest, corpus round-trip, and the reference `flac` 1.5.0
+decoding every stream back to its source samples); the two output changes
+are listed under Changed.
+
+### Changed
+
+- *(encode)* LPC coefficients are 15 bits (was 14), the format maximum and
+  libFLAC's choice above 16 bits. Level 8: 96 kHz/24 -3.2%, 384 kHz/24 -4.4%,
+  48 kHz piano -0.45%; corpus total -3.2% (worst file +0.02%). Part of the
+  high-rate gap in [#22](https://github.com/Remade-With-Rust/rusty_flac/issues/22).
+- *(encode)* Levels 0-2 analyse one window instead of two: 17-21% faster at
+  level 0 for +1.3% size there (still 7% under `flac -0`). Levels 3-8 unchanged.
+
+### Performance
+
+- Encode at levels 5/8 executes 48%/52% fewer instructions than 0.2.2 at
+  44.1 kHz and 46%/46% fewer at 96 kHz (callgrind, AVX2 host); wall time
+  -39%/-44% and -40%/-33%.
+- Decode executes 9% fewer instructions on `flac -8` streams and 12% fewer on
+  `flac -5` streams.
+- Encode: Rice partition order capped at 7 (was 8; order 8 changed no corpus
+  file); AVX2 LPC residual for sharp predictors (checked per vector) and an
+  i32-lane residual where the sums provably fit; u32-lane Rice sums and a
+  bounds-check-free partition merge; warm-started convex Rice parameter
+  search; AVX2 twins of the windowing pass and the partition planner;
+  autocorrelation lags in groups of eight; Rice runs written 32 bits at a
+  time (BMI2 twin); u32-lane fixed-order sums; single-pass stereo channel
+  construction and deinterleave; packed MD5 interleave and three-operation
+  MD5 F/G.
+- Decode: LPC restore unrolled by four with BMI2 shifts and a 128-bit window
+  for orders 5-8; mask-free Rice code assembly; Rice refill threshold k + 5.
+
 ## [0.2.2](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.2.1...v0.2.2) - 2026-10-24
 
 ### Other

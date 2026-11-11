@@ -36,10 +36,20 @@ our memory-safe FFmpeg alternative, alongside
 A pure-Rust lossless audio codec that beats the C reference on **speed and
 compression at the same time**, without giving up a byte of interoperability:
 
-- **Faster than FFmpeg on both sides.** Encode at the maximum compression
-  level runs **0.83× FFmpeg's CPU time** (17.3% faster); decode runs **0.77×**
-  (22.7% faster). Measured pinned, CPU-time, ABBA-interleaved, 31 pairs —
-  **31/31 wins on both, z = 5.57** (method below).
+- **0.3.0: about half the instructions per encode, 9-12% fewer per decode.**
+  Encode at levels 5 and 8 is 39-44% faster than 0.2.2 at 44.1 kHz and 33-40%
+  at 96 kHz on the wall clock, and 15-bit LPC coefficients cut level-8 output
+  by 3.2%. Twenty of the speed wins are byte-identical, each confirmed on
+  the wall clock. Against libFLAC 1.5.0
+  (`flac`), whole process including file I/O: level 8 encodes **2.4x faster at
+  44.1 kHz and 3.9x faster at 96 kHz**, level 5 matches its speed with smaller
+  output at 44.1 kHz, and decode is 16% faster at 16-bit (details below).
+
+- **Faster than FFmpeg on both sides** (measured at 0.2.2; 0.3.0 is faster
+  still). Encode at the maximum compression level ran **0.83× FFmpeg's CPU
+  time** (17.3% faster); decode **0.77×** (22.7% faster). Measured pinned,
+  CPU-time, ABBA-interleaved, 31 pairs — **31/31 wins on both, z = 5.57**
+  (method below).
 - **Smaller output on every gate clip.** Across the standing gate matrix
   (music / sine / noise / pink noise / silence × 16-bit and 24-bit × two
   levels), rusty_flac's files are smaller than FFmpeg's on **20 of 20**
@@ -50,10 +60,12 @@ compression at the same time**, without giving up a byte of interoperability:
   the spec's MD5 signature, so `flac -t` verifies our output too.
 - **No required dependencies.** No C, no FFI — the bit I/O, CRCs,
   MD5, LPC analysis, Rice coding and all four stereo modes are in this crate.
-  `unsafe` exists only inside four AVX2 kernels (integer autocorrelation,
-  Rice parameter sums, fixed-order estimation, LPC residual), each runtime-detected
-  with a scalar twin kept as oracle and fallback, gated **bit-identical** by
-  tests — on any other CPU you get the same bytes from safe Rust.
+  `unsafe` is confined to runtime-detected AVX2/BMI2 kernels (autocorrelation,
+  windowing, Rice sums and planning, fixed-order estimation, LPC residual and
+  restore, Rice reading and writing), each with a portable twin kept as oracle
+  and fallback and gated **bit-identical** by tests, plus a few writes into
+  reserved buffers with their initialization proven at the site. On any other
+  CPU you get the same bytes.
 
 | | FFmpeg flac (C) | **rusty_flac (Rust)** |
 |---|---|---|
@@ -66,6 +78,31 @@ compression at the same time**, without giving up a byte of interoperability:
 | License | LGPL/GPL | **Apache-2.0** (embed freely) |
 
 ### Performance (single core, this machine)
+
+**0.3.0 against libFLAC 1.5.0** (`flac`, the C reference), 60 s of stereo
+guitar at 44.1 kHz/16 and its 96 kHz/24 render. Whole process for both,
+including file read, write and the STREAMINFO MD5; interleaved, pinned to
+one core, best of 18 (the host was busy, so medians are not quoted). Every
+output is checked: our streams pass `flac -t`, and our decode matches
+`flac -d` byte for byte.
+
+| workload | rusty_flac 0.3.0 | flac 1.5.0 | time | size vs flac |
+|---|---:|---:|---:|---:|
+| Encode 44.1 kHz/16, level 8 | **88.9 ms** | 215.2 ms | **0.41x (2.4x faster)** | +1.2% |
+| Encode 44.1 kHz/16, level 5 | **79.4 ms** | 85.9 ms | **0.92x** | **-0.1%** |
+| Encode 96 kHz/24, level 8 | **256.0 ms** | 1,006.6 ms | **0.25x (3.9x faster)** | +4.0% |
+| Encode 96 kHz/24, level 5 | 243.3 ms | 230.2 ms | 1.06x | +1.3% |
+| Decode 44.1 kHz/16 | **45.9 ms** | 54.6 ms | **0.84x** | |
+| Decode 96 kHz/24 | 143.4 ms | 144.3 ms | 0.99x | |
+
+**0.3.0 against 0.2.2** (same files): encode at levels 5/8 executes
+**-48.0% / -51.6%** instructions at 44.1 kHz and **-45.5% / -45.6%** at
+96 kHz (callgrind, deterministic), and runs **39% / 44%** and **40% / 33%**
+faster on the wall clock (pinned, interleaved, best of 25). Decode executes
+**-9%** on `flac -8` streams and **-12%** on `flac -5` streams. What changed
+is in the [changelog](CHANGELOG.md).
+
+**FFmpeg 8.1.2**, measured at 0.2.2:
 
 Measured against FFmpeg 8.1.2's native `flac` encoder/decoder over a 180 s
 44.1 kHz stereo music clip (guitar / piano / vocal corpus):
