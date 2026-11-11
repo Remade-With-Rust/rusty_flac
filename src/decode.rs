@@ -799,8 +799,14 @@ fn restore_lpc(buf: &mut [i32], qlp: &[i32], shift: u32) {
         && std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("bmi2")
     {
-        // SAFETY: the CPU supports the feature the kernel was compiled for.
-        return unsafe { restore_lpc_avx2(buf, qlp, shift) };
+        // SAFETY: the CPU supports the features the kernels were compiled for.
+        return unsafe {
+            if qlp.len() <= 8 {
+                restore_lpc_o8(buf, qlp, shift)
+            } else {
+                restore_lpc_avx2(buf, qlp, shift)
+            }
+        };
     }
     restore_lpc_scalar(buf, qlp, shift)
 }
@@ -876,6 +882,68 @@ unsafe fn restore_lpc_avx2(buf: &mut [i32], qlp: &[i32], shift: u32) {
     // (two-operand `imul` destroys a source), as did loading the shift count
     // into `cl` (BMI2's `sarx` takes it from any register). The arithmetic
     // and the recurrence's dependency chain are unchanged.
+    let mut chunks = buf[order..].chunks_exact_mut(4);
+    for q in &mut chunks {
+        let [s0, s1, s2, s3] = q else { unreachable!() };
+        let x0 = step!(s0, h3, h2, h1, h0);
+        let x1 = step!(s1, h2, h1, h0, x0);
+        let x2 = step!(s2, h1, h0, x0, x1);
+        let x3 = step!(s3, h0, x0, x1, x2);
+        (h3, h2, h1, h0) = (x0, x1, x2, x3);
+    }
+    for slot in chunks.into_remainder() {
+        let x = step!(slot, h3, h2, h1, h0);
+        (h3, h2, h1, h0) = (h2, h1, h0, x);
+    }
+}
+
+/// [`restore_lpc_avx2`] for orders 5..=8 -- level 5, `flac`'s default, and
+/// below: lags 5..=8 are four taps, so the window is one 128-bit register
+/// and its horizontal sum one shuffle and add, where the 256-bit window of
+/// lags 5..=12 paid a cross-lane extract and a second add stage for taps
+/// that are zero at these orders. Same exact i64 arithmetic, same unrolled
+/// recurrence.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,bmi2")]
+unsafe fn restore_lpc_o8(buf: &mut [i32], qlp: &[i32], shift: u32) {
+    use core::arch::x86_64::*;
+    let order = qlp.len();
+    debug_assert!((5..=8).contains(&order) && buf.len() >= order);
+    let c = |j: usize| qlp.get(j).map_or(0i64, |&v| v as i64);
+    let (c0, c1, c2, c3) = (c(0), c(1), c(2), c(3));
+    // Lane j holds the sample of lag 5 + j: even lanes (lags 5, 7) multiply
+    // in `ce`, odd lanes (lags 6, 8), after the 32-bit shift, in `co`.
+    let ce = _mm_set_epi64x(c(6), c(4));
+    let co = _mm_set_epi64x(c(7), c(5));
+    let mut init = [0i32; 4];
+    for (j, w) in init.iter_mut().enumerate() {
+        if let Some(k) = order.checked_sub(5 + j) {
+            *w = buf[k];
+        }
+    }
+    // SAFETY: `init` is 4 readable i32s.
+    let mut win = unsafe { _mm_loadu_si128(init.as_ptr() as *const __m128i) };
+    let (mut h3, mut h2, mut h1, mut h0) = (
+        buf[order - 4] as i64,
+        buf[order - 3] as i64,
+        buf[order - 2] as i64,
+        buf[order - 1] as i64,
+    );
+    macro_rules! step {
+        ($slot:expr, $oldest:ident, $h2:ident, $h1:ident, $h0:ident) => {{
+            let p = _mm_add_epi64(
+                _mm_mul_epi32(win, ce),
+                _mm_mul_epi32(_mm_srli_epi64::<32>(win), co),
+            );
+            let old = _mm_cvtsi128_si64(_mm_add_epi64(p, _mm_unpackhi_epi64(p, p)));
+            let sum = old + c3 * $oldest + c2 * $h2 + c1 * $h1 + c0 * $h0;
+            let x = $slot.wrapping_add((sum >> shift) as i32);
+            *$slot = x;
+            // Lags age by one; the lag-4 sample enters lane 0.
+            win = _mm_alignr_epi8::<12>(win, _mm_set1_epi32($oldest as i32));
+            x as i64
+        }};
+    }
     let mut chunks = buf[order..].chunks_exact_mut(4);
     for q in &mut chunks {
         let [s0, s1, s2, s3] = q else { unreachable!() };
