@@ -82,5 +82,8 @@ fn encoder_output_digest() {
 /// (was 0xe97402e36f8f2429): an intended output change, gated on the corpus
 /// (total -3.2% at level 8) and on the reference `flac` decoding every
 /// stream back to its source samples.
+///
+/// Re-pinned when levels 0-2 went to a single analysis window (was
+/// 0xe0fd27cdb6828b64): intended, levels 3-8 unchanged.
 #[cfg(feature = "libm")]
-const PINNED_LIBM: u64 = 0xe0fd27cdb6828b64;
+const PINNED_LIBM: u64 = 0xaaca7b9abedf7591;

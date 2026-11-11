@@ -173,6 +173,11 @@ impl Encoder {
     /// `0..=8`, the ffmpeg/libFLAC-style speed-vs-ratio knob (maps onto the max
     /// LPC order searched).
     pub fn set_compression_level(&mut self, level: u32) {
+        // Levels 0-2 analyse one window, not two: the second window's
+        // autocorrelation, its estimate and (when it is close) its
+        // realization are the cost that made these levels nearly as slow as
+        // level 5 while producing identical output to one another.
+        self.wins.single = level <= 2;
         self.max_lpc_order = if level <= 2 {
             4
         } else if level <= 5 {
@@ -597,6 +602,9 @@ struct WindowCache {
     /// stream of the same length reuses them.
     short_n: usize,
     short: [Tapers; 2],
+    /// Levels 0-2: analyse with the first window only (see
+    /// `set_compression_level`). False -- both windows -- by default.
+    single: bool,
     /// Taper builds, for the reuse test: a cache that misses is otherwise
     /// invisible, the output being byte-identical either way.
     #[cfg(test)]
@@ -616,6 +624,15 @@ impl WindowCache {
             for (slot, &alpha) in self.short.iter_mut().zip(&WINDOW_ALPHAS) {
                 *slot = tukey_tapers(n, alpha);
             }
+        }
+    }
+
+    /// Windows the analysis tries: one at levels 0-2, both above.
+    fn count(&self) -> usize {
+        if self.single {
+            1
+        } else {
+            WINDOW_ALPHAS.len()
         }
     }
 
@@ -2241,7 +2258,7 @@ fn realize_arm(
     let max_order = max_lpc_order.min(n / 2);
     let mut all_ests: Vec<Option<LpcEstimate>> = est.ests;
     if max_order >= 1 {
-        for k in all_ests.len()..WINDOW_ALPHAS.len() {
+        for k in all_ests.len()..wins.count() {
             all_ests.push(lpc_estimate(
                 samples,
                 bps,
