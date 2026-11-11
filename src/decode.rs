@@ -74,6 +74,9 @@ pub struct FrameDecoder {
     info: StreamInfo,
     /// Scratch: per-channel decode buffers (channel-assignment domain).
     scratch: Vec<Vec<i32>>,
+    /// The side channel of a 32-bit stereo frame (33 bits wide, so it does
+    /// not fit the `i32` scratch). Empty until such a frame shows up.
+    wide: Vec<i64>,
 }
 
 impl StreamInfo {
@@ -95,7 +98,11 @@ impl FrameDecoder {
             return Err(DecodeError::Inconsistent("channels"));
         }
         let scratch = vec![Vec::new(); info.channels as usize];
-        Ok(FrameDecoder { info, scratch })
+        Ok(FrameDecoder {
+            info,
+            scratch,
+            wide: Vec::new(),
+        })
     }
 
     pub fn streaminfo(&self) -> &StreamInfo {
@@ -331,6 +338,7 @@ impl FrameDecoder {
         );
 
         // --- subframes ---
+        let mut wide_side = false;
         for (c, buf) in self.scratch.iter_mut().take(nch).enumerate() {
             let is_side = c < 2 && side_ch[c];
             let sub_bps = bps + u32::from(is_side);
@@ -341,8 +349,26 @@ impl FrameDecoder {
                 buf.clear();
                 buf.resize(bs, 0);
             }
-            decode_subframe(&mut br, bs, sub_bps, buf)?;
+            if sub_bps > 32 {
+                // 32-bit stereo side channel: decoded into `wide` (i64), with
+                // `buf` holding only its i32 residuals.
+                decode_subframe_wide(&mut br, bs, sub_bps, buf, &mut self.wide)?;
+                wide_side = true;
+            } else {
+                decode_subframe(&mut br, bs, sub_bps, buf)?;
+            }
         }
+        // A wide side channel is undone right here (in i64), so the scratch
+        // leaves holding left/right: report the frame as independent.
+        let ch_assign = if wide_side {
+            let [a, b] = &mut self.scratch[..] else {
+                unreachable!("side channels are stereo only")
+            };
+            undo_wide_side(ch_assign, &mut a[..bs], &mut b[..bs], &self.wide[..bs]);
+            1
+        } else {
+            ch_assign
+        };
 
         // --- footer ---
         let crc_scope = prof::scope(Stage::Crc16);
@@ -681,6 +707,139 @@ fn decode_subframe(
         }
     }
     Ok(())
+}
+
+/// Decode one subframe wider than 32 bits (the 33-bit side channel of a
+/// 32-bit stereo frame) into `out` as `i64`. Residuals still fit `i32` (the
+/// format requires it), so they are read into `res` by [`decode_residual`];
+/// prediction and the wasted-bits shift run in `i64`. Wrapping arithmetic
+/// keeps a hostile stream from panicking; a valid one never wraps (33-bit
+/// samples, 15-bit coefficients, at most 32 taps).
+fn decode_subframe_wide(
+    br: &mut BitReader,
+    bs: usize,
+    bps: u32,
+    res: &mut [i32],
+    out: &mut Vec<i64>,
+) -> Result<(), DecodeError> {
+    debug_assert_eq!(res.len(), bs);
+    prof::count(Ctr::Subframes, 1);
+    out.clear();
+    out.resize(bs, 0);
+    if br.read_bits(1).ok_or(DecodeError::Truncated)? != 0 {
+        return Err(DecodeError::BadSubframe("padding bit"));
+    }
+    let ty = br.read_bits(6).ok_or(DecodeError::Truncated)?;
+    let wasted = if br.read_bits(1).ok_or(DecodeError::Truncated)? == 1 {
+        br.read_unary().ok_or(DecodeError::Truncated)? + 1
+    } else {
+        0
+    };
+    if wasted >= bps {
+        return Err(DecodeError::BadSubframe("wasted bits >= bps"));
+    }
+    let ebps = bps - wasted;
+    let warm_up = |out: &mut [i64], br: &mut BitReader| -> Result<(), DecodeError> {
+        for slot in out.iter_mut() {
+            *slot = br.read_signed_wide(ebps).ok_or(DecodeError::Truncated)?;
+        }
+        Ok(())
+    };
+
+    match ty {
+        0b000000 => {
+            let v = br.read_signed_wide(ebps).ok_or(DecodeError::Truncated)?;
+            out.fill(v);
+        }
+        0b000001 => warm_up(out, br)?,
+        0b001000..=0b001100 => {
+            let order = (ty & 0x07) as usize;
+            if order > bs {
+                return Err(DecodeError::BadSubframe("fixed order > blocksize"));
+            }
+            warm_up(&mut out[..order], br)?;
+            decode_residual(br, bs, order, res)?;
+            for i in order..bs {
+                let x = |k: usize| out[i - k];
+                let pred = match order {
+                    0 => 0,
+                    1 => x(1),
+                    2 => x(1).wrapping_mul(2).wrapping_sub(x(2)),
+                    3 => x(1).wrapping_sub(x(2)).wrapping_mul(3).wrapping_add(x(3)),
+                    _ => x(1)
+                        .wrapping_add(x(3))
+                        .wrapping_mul(4)
+                        .wrapping_sub(x(2).wrapping_mul(6))
+                        .wrapping_sub(x(4)),
+                };
+                out[i] = pred.wrapping_add(res[i] as i64);
+            }
+        }
+        0b100000..=0b111111 => {
+            let order = ((ty & 0x1F) + 1) as usize;
+            if order > bs {
+                return Err(DecodeError::BadSubframe("lpc order > blocksize"));
+            }
+            warm_up(&mut out[..order], br)?;
+            let prec = br.read_bits(4).ok_or(DecodeError::Truncated)? + 1;
+            if prec > 15 {
+                return Err(DecodeError::BadSubframe("qlp precision 16"));
+            }
+            let shift = br.read_signed(5).ok_or(DecodeError::Truncated)?;
+            if shift < 0 {
+                return Err(DecodeError::BadSubframe("negative shift"));
+            }
+            let mut qlp = [0i64; 32];
+            for q in qlp.iter_mut().take(order) {
+                *q = br.read_signed(prec).ok_or(DecodeError::Truncated)? as i64;
+            }
+            decode_residual(br, bs, order, res)?;
+            for i in order..bs {
+                let mut sum = 0i64;
+                for (j, &q) in qlp[..order].iter().enumerate() {
+                    sum = sum.wrapping_add(q.wrapping_mul(out[i - 1 - j]));
+                }
+                out[i] = (sum >> shift).wrapping_add(res[i] as i64);
+            }
+        }
+        _ => return Err(DecodeError::BadSubframe("reserved type")),
+    }
+
+    if wasted > 0 {
+        for v in out.iter_mut() {
+            *v = v.wrapping_shl(wasted);
+        }
+    }
+    Ok(())
+}
+
+/// Undo a stereo assignment whose side channel is wide (`side`, i64): the
+/// other coded channel is in `a` (left, mid) or `b` (right), and both come
+/// out as left/right. Exact in i64; the results fit i32 in a valid stream.
+fn undo_wide_side(ch_assign: u32, a: &mut [i32], b: &mut [i32], side: &[i64]) {
+    let lr = a.iter_mut().zip(b.iter_mut()).zip(side);
+    match ch_assign {
+        8 => {
+            // left/side: R = L - side
+            for ((l, r), &s) in lr {
+                *r = (*l as i64).wrapping_sub(s) as i32;
+            }
+        }
+        9 => {
+            // side/right: L = side + R
+            for ((l, r), &s) in lr {
+                *l = s.wrapping_add(*r as i64) as i32;
+            }
+        }
+        _ => {
+            // mid/side: mid = (L + R) >> 1 lost the low bit, which side keeps
+            for ((m, r), &s) in lr {
+                let sum = ((*m as i64) << 1) | (s & 1);
+                *m = (sum.wrapping_add(s) >> 1) as i32;
+                *r = (sum.wrapping_sub(s) >> 1) as i32;
+            }
+        }
+    }
 }
 
 /// Partitioned Rice residual: appends `bs - order` residuals to `out`
@@ -1349,5 +1508,190 @@ mod tests {
     fn rejects_garbage() {
         assert!(decode(b"not a flac stream at all").is_err());
         assert!(decode(b"fLaC").is_err());
+    }
+}
+
+/// 32-bit stereo with a 33-bit side channel, on hand-built frames: side
+/// values out to ±(2^32 − 1), every stereo assignment, and the side coded
+/// as CONSTANT, VERBATIM, wasted-bits VERBATIM, FIXED and LPC.
+#[cfg(test)]
+mod wide_side_tests {
+    use super::*;
+    use crate::bitio::BitWriter;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        Constant,
+        Verbatim,
+        Wasted,
+        Fixed2,
+        Lpc2,
+    }
+
+    /// One subframe of `v` at `bps` bits. Residuals go out as one escaped
+    /// partition of 31-bit raw values (the widest an escape can declare).
+    fn subframe(bw: &mut BitWriter, kind: Kind, v: &[i64], bps: u32) {
+        let residual = |bw: &mut BitWriter, res: &[i64]| {
+            bw.write_bits(1, 2); // Rice2
+            bw.write_bits(0, 4); // partition order 0
+            bw.write_bits(31, 5); // escape
+            bw.write_bits(31, 5); // raw width (the field's maximum)
+            for &r in res {
+                assert!(
+                    (-(1 << 30)..1 << 30).contains(&r),
+                    "residual {r} must fit 31 bits"
+                );
+                bw.write_bits(r as u64, 31);
+            }
+        };
+        bw.write_bits(0, 1);
+        match kind {
+            Kind::Constant => {
+                assert!(v.iter().all(|&x| x == v[0]));
+                bw.write_bits(0b000000, 6);
+                bw.write_bits(0, 1);
+                bw.write_bits(v[0] as u64, bps);
+            }
+            Kind::Verbatim => {
+                bw.write_bits(0b000001, 6);
+                bw.write_bits(0, 1);
+                for &x in v {
+                    bw.write_bits(x as u64, bps);
+                }
+            }
+            Kind::Wasted => {
+                assert!(v.iter().all(|&x| x & 1 == 0));
+                bw.write_bits(0b000001, 6);
+                bw.write_bits(1, 1); // wasted bits follow, unary k-1 = 0
+                bw.write_bits(1, 1);
+                for &x in v {
+                    bw.write_bits((x >> 1) as u64, bps - 1);
+                }
+            }
+            Kind::Fixed2 => {
+                bw.write_bits(0b001010, 6);
+                bw.write_bits(0, 1);
+                bw.write_bits(v[0] as u64, bps);
+                bw.write_bits(v[1] as u64, bps);
+                let res: Vec<i64> = (2..v.len())
+                    .map(|i| v[i] - (2 * v[i - 1] - v[i - 2]))
+                    .collect();
+                residual(bw, &res);
+            }
+            Kind::Lpc2 => {
+                let (q, shift) = ([27i64, -12], 4u32);
+                bw.write_bits(0b100001, 6); // LPC order 2
+                bw.write_bits(0, 1);
+                bw.write_bits(v[0] as u64, bps);
+                bw.write_bits(v[1] as u64, bps);
+                bw.write_bits(15 - 1, 4); // precision 15
+                bw.write_bits(shift as u64, 5);
+                for c in q {
+                    bw.write_bits(c as u64, 15);
+                }
+                let res: Vec<i64> = (2..v.len())
+                    .map(|i| v[i] - ((q[0] * v[i - 1] + q[1] * v[i - 2]) >> shift))
+                    .collect();
+                residual(bw, &res);
+            }
+        }
+    }
+
+    /// A whole 32-bit stereo frame: header, two subframes, CRCs.
+    fn frame(ch_assign: u32, bs: usize, subs: impl FnOnce(&mut BitWriter)) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.write_bits(0x3FFE, 14);
+        bw.write_bits(0, 2); // reserved, fixed blocking
+        bw.write_bits(7, 4); // explicit 16-bit block size
+        bw.write_bits(0, 4); // rate from STREAMINFO
+        bw.write_bits(ch_assign as u64, 4);
+        bw.write_bits(7, 3); // 32 bits per sample
+        bw.write_bits(0, 1);
+        bw.write_bits(0, 8); // frame number 0
+        bw.write_bits(bs as u64 - 1, 16);
+        let c = crc8(bw.bytes());
+        bw.write_bits(c as u64, 8);
+        subs(&mut bw);
+        bw.align_to_byte();
+        let c = crc16(bw.bytes());
+        bw.write_bits(c as u64, 16);
+        bw.into_bytes()
+    }
+
+    #[test]
+    fn decodes_33_bit_side_channels() {
+        const BS: usize = 16;
+        const MAX: i64 = i32::MAX as i64;
+        const MIN: i64 = i32::MIN as i64;
+        type Gen = fn(i64) -> (i64, i64);
+        let signals: [(&str, Gen, &[Kind]); 4] = [
+            // side = 2^32 - 1 - 12i: the largest 33-bit side there is
+            (
+                "max side",
+                |i| (MAX - 7 * i, MIN + 5 * i),
+                &[Kind::Verbatim, Kind::Fixed2, Kind::Lpc2],
+            ),
+            // side = -(2^32 - 1) + 12i
+            (
+                "min side",
+                |i| (MIN + 3 * i, MAX - 9 * i),
+                &[Kind::Verbatim, Kind::Fixed2, Kind::Lpc2],
+            ),
+            (
+                "const side",
+                |i| (MAX - i, MIN + 16 - i),
+                &[Kind::Constant, Kind::Verbatim],
+            ),
+            (
+                "even side",
+                |i| (MAX - 2 * i, MIN + 1 + 4 * i),
+                &[Kind::Wasted, Kind::Fixed2],
+            ),
+        ];
+        let info = StreamInfo {
+            channels: 2,
+            bits_per_sample: 32,
+            ..StreamInfo::default()
+        };
+        let mut dec = FrameDecoder::new(info).unwrap();
+        for (name, gen, kinds) in signals {
+            let (l, r): (Vec<i64>, Vec<i64>) = (0..BS as i64).map(gen).unzip();
+            let side: Vec<i64> = l.iter().zip(&r).map(|(a, b)| a - b).collect();
+            let mid: Vec<i64> = l.iter().zip(&r).map(|(a, b)| (a + b) >> 1).collect();
+            assert!(side.iter().any(|&s| i32::try_from(s).is_err()), "{name}");
+            let want = [
+                l.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+                r.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+            ];
+            let want_il: Vec<i32> = (0..BS).flat_map(|i| [want[0][i], want[1][i]]).collect();
+            for &kind in kinds {
+                for (ch_assign, first, second) in
+                    [(8, &l, &side), (9, &side, &r), (10, &mid, &side)]
+                {
+                    let bytes = frame(ch_assign, BS, |bw| {
+                        let (k0, b0) = if ch_assign == 9 {
+                            (kind, 33)
+                        } else {
+                            (Kind::Verbatim, 32)
+                        };
+                        let (k1, b1) = if ch_assign == 9 {
+                            (Kind::Verbatim, 32)
+                        } else {
+                            (kind, 33)
+                        };
+                        subframe(bw, k0, first, b0);
+                        subframe(bw, k1, second, b1);
+                    });
+                    let what = format!("{name}, {kind:?} side, assignment {ch_assign}");
+                    let mut out = vec![Vec::new(), Vec::new()];
+                    let (bs, used) = dec.decode_frame(&bytes, &mut out).expect(&what);
+                    assert_eq!((bs, used), (BS, bytes.len()), "{what}");
+                    assert_eq!(out, want, "{what}");
+                    let mut il: Vec<i32> = Vec::new();
+                    dec.decode_frame_interleaved(&bytes, &mut il).expect(&what);
+                    assert_eq!(il, want_il, "{what} (interleaved)");
+                }
+            }
+        }
     }
 }

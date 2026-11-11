@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.3.0...v0.3.1) - 2026-11-11
+
+### Fixed
+
+- *(decode)* 32-bit stereo streams with a side channel (left/side, side/right,
+  mid/side, as `flac` writes them) no longer panic or decode to wrong samples:
+  the 33-bit side channel is decoded and undone in i64. Before this,
+  `flac -5`/`-8` 32-bit stereo files decoded silently wrong.
+  ([#20](https://github.com/Remade-With-Rust/rusty_flac/pull/20), by @benedictjohannes)
+
 ## [0.3.0](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.2.2...v0.3.0) - 2026-11-11
 
 Speed and compression release. Every speed change is byte-identical (pinned
