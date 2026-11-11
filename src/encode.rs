@@ -1146,10 +1146,24 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize, scratch: &mut EncodeScratch
             // Merge pairs into the front half for the next-coarser level: row
             // i = row 2i + row 2i+1. Row i is written only after rows <= 2i+1
             // are read, so ascending order is safe in place.
-            for i in 0..n_part / 2 {
-                for k in 0..stride {
-                    sums[i * stride + k] =
-                        sums[2 * i * stride + k] + sums[(2 * i + 1) * stride + k];
+            //
+            // Through split slices and zipped rows, not `sums[..]` indexing:
+            // three bounds checks per element kept the loop scalar at 15
+            // instructions an element, a third of the planner. Row 0 is the
+            // only one whose destination is one of its own sources, so it is
+            // done in place first; every later row's destination lies below
+            // both of its sources.
+            {
+                let (r0, rest) = sums.split_at_mut(stride);
+                for (d, &b) in r0.iter_mut().zip(&rest[..stride]) {
+                    *d += b;
+                }
+            }
+            for i in 1..n_part / 2 {
+                let (head, tail) = sums.split_at_mut(2 * i * stride);
+                let (a, b) = tail[..2 * stride].split_at(stride);
+                for ((d, &x), &y) in head[i * stride..(i + 1) * stride].iter_mut().zip(a).zip(b) {
+                    *d = x + y;
                 }
             }
             po -= 1;
