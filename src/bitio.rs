@@ -64,7 +64,27 @@ impl BitWriter {
     /// `Vec` push, with its capacity check, per byte of every codeword. A
     /// codeword longer than 32 bits (a large escape quotient) leaves the
     /// fast loop for the general path.
+    #[inline]
     pub fn write_rice_run(&mut self, res: &[i32], k: u32) {
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if std::arch::is_x86_feature_detected!("bmi2") {
+            // SAFETY: the CPU supports the feature the twin was compiled for.
+            return unsafe { self.write_rice_run_bmi2(res, k) };
+        }
+        self.write_rice_run_body(res, k)
+    }
+
+    /// [`BitWriter::write_rice_run`] compiled for BMI2: the per-codeword
+    /// `acc << total` and `u >> k` become flag-free `shlx`/`shrx` instead of
+    /// a move through `cl` each. Same body, same output.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[target_feature(enable = "bmi1,bmi2")]
+    unsafe fn write_rice_run_bmi2(&mut self, res: &[i32], k: u32) {
+        self.write_rice_run_body(res, k)
+    }
+
+    #[inline(always)]
+    fn write_rice_run_body(&mut self, res: &[i32], k: u32) {
         debug_assert!(k <= 30 && self.nbits < 8);
         let mask = (1u32 << k) - 1;
         let stop = 1u64 << k;
