@@ -1129,6 +1129,37 @@ fn max_partition_order(bs: usize, p: usize) -> u32 {
 /// computed in ONE pass: shifted sums per finest partition, merged pairwise
 /// upward — O(15n) total instead of O(15n) per order.
 fn plan_partitions(res: &[i32], bs: usize, p: usize, scratch: &mut EncodeScratch) -> ResidualPlan {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the runtime AVX2 check.
+            return unsafe { plan_partitions_avx2(res, bs, p, scratch) };
+        }
+    }
+    plan_partitions_body(res, bs, p, scratch)
+}
+
+/// [`plan_partitions`] compiled for AVX2: its row-width pass (the zigzag OR
+/// over the whole residual) ran at the SSE2 baseline, 15 instructions per 8
+/// samples, and the finest-level kernels now inline into it. Same body.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2")]
+unsafe fn plan_partitions_avx2(
+    res: &[i32],
+    bs: usize,
+    p: usize,
+    scratch: &mut EncodeScratch,
+) -> ResidualPlan {
+    plan_partitions_body(res, bs, p, scratch)
+}
+
+#[inline(always)]
+fn plan_partitions_body(
+    res: &[i32],
+    bs: usize,
+    p: usize,
+    scratch: &mut EncodeScratch,
+) -> ResidualPlan {
     let max_po = max_partition_order(bs, p);
     let finest_parts = 1usize << max_po;
     let finest_size = bs >> max_po;
