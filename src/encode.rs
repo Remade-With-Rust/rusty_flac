@@ -199,14 +199,29 @@ impl Encoder {
         }
         let n = samples.len() / ch;
         if ch == 2 {
-            // Whole frames through `chunks_exact`, whose length is exact, so
-            // `extend` writes without a capacity check per sample; `step_by`
-            // over the flat slice is not, and walked it a sample at a time.
+            // Whole frames through `chunks_exact` into reserved space: no
+            // capacity check per sample, one pass. `step_by` over the flat
+            // slice walked it once per channel, a sample at a time.
             let [l, r] = &mut self.chans[..] else {
                 unreachable!("two channels")
             };
-            l.extend(samples.chunks_exact(2).map(|f| f[0]));
-            r.extend(samples.chunks_exact(2).map(|f| f[1]));
+            // One pass over the frames writes both channels' reserved tails.
+            let (l0, r0) = (l.len(), r.len());
+            l.reserve(n);
+            r.reserve(n);
+            for ((a, b), f) in l.spare_capacity_mut()[..n]
+                .iter_mut()
+                .zip(&mut r.spare_capacity_mut()[..n])
+                .zip(samples.chunks_exact(2))
+            {
+                a.write(f[0]);
+                b.write(f[1]);
+            }
+            // SAFETY: the loop initialized the `n` slots past each old length.
+            unsafe {
+                l.set_len(l0 + n);
+                r.set_len(r0 + n);
+            }
             return Ok(());
         }
         for (c, chan) in self.chans.iter_mut().enumerate() {
@@ -2588,10 +2603,25 @@ fn decide_stereo<'a>(
 ) -> (u64, Vec<Subframe<'a>>) {
     // Mid and side in one pass, owned by their arms: a chosen one moves out
     // as the subframe's samples instead of being copied out of a borrow.
-    let mut side: Vec<i32> = Vec::with_capacity(l.len());
-    let mut mid: Vec<i32> = Vec::with_capacity(l.len());
-    side.extend(l.iter().zip(r).map(|(&a, &b)| a - b));
-    mid.extend(l.iter().zip(r).map(|(&a, &b)| (a + b) >> 1));
+    // One fused pass writes both into reserved space (two `extend`s read
+    // l and r twice).
+    let n = l.len().min(r.len());
+    let mut side: Vec<i32> = Vec::with_capacity(n);
+    let mut mid: Vec<i32> = Vec::with_capacity(n);
+    for (((s, m), &a), &b) in side.spare_capacity_mut()[..n]
+        .iter_mut()
+        .zip(&mut mid.spare_capacity_mut()[..n])
+        .zip(l)
+        .zip(r)
+    {
+        s.write(a - b);
+        m.write((a + b) >> 1);
+    }
+    // SAFETY: the loop above initialized the first `n` slots of both.
+    unsafe {
+        side.set_len(n);
+        mid.set_len(n);
+    }
 
     // Wasted-bits detection + shift per arm, then estimates for all four.
     let arms = [
