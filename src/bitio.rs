@@ -385,10 +385,12 @@ impl<'a> BitReader<'a> {
         // constants and reloaded three from the stack on every code.
         let (kp1, top) = (k + 1, 63 - k);
         // For small k (16-bit material), refill only when a code with a
-        // quotient of up to 12 might not fit: fewer and more regularly
-        // spaced refills than "below 32 bits", so the branch mispredicts
-        // less. Larger k keeps 32 (measured: k + 13 there was slower).
-        let refill_below = if k <= 12 { k + 13 } else { 32 };
+        // quotient of up to 4 might not fit; a longer one (rare: the
+        // parameter is chosen so most quotients are 0..2) breaks to the
+        // general path, which refills. Refilling earlier, below k + 13 as
+        // before, spent a refill on codes that fit anyway: k + 5 counts 0.7%
+        // fewer decode instructions and times no slower. Larger k keeps 32.
+        let refill_below = if k <= 12 { k + 5 } else { 32 };
         let mut i = 0;
         while i < out.len() {
             if n < refill_below {
