@@ -1727,7 +1727,7 @@ unsafe fn lpc_residual_avx2_i32(
         for (k, &c) in qlp[..order].iter().enumerate() {
             sum += c * *p.add(j - 1 - k);
         }
-        *out.add(j - order) = *p.add(j) - (sum >> shift);
+        *out.add(j - order) = (*p.add(j)).wrapping_sub(sum >> shift);
     }
     // SAFETY: slots 0..n - order were each written above.
     res.set_len(n - order);
@@ -1782,7 +1782,7 @@ unsafe fn lpc_residual_avx2<const CHECK: bool>(
                 for (k, &c) in qlp[..order].iter().enumerate() {
                     sum += c as i64 * *p.add(j - 1 - k) as i64;
                 }
-                *out.add(j - order) = *p.add(j) - (sum >> shift) as i32;
+                *out.add(j - order) = (*p.add(j)).wrapping_sub((sum >> shift) as i32);
             }
             i += 4;
             continue;
@@ -1797,7 +1797,7 @@ unsafe fn lpc_residual_avx2<const CHECK: bool>(
         for (k, &c) in qlp[..order].iter().enumerate() {
             sum += c as i64 * *p.add(j - 1 - k) as i64;
         }
-        *out.add(j - order) = *p.add(j) - (sum >> shift) as i32;
+        *out.add(j - order) = (*p.add(j)).wrapping_sub((sum >> shift) as i32);
     }
     // SAFETY: slots 0..n - order were each written above.
     res.set_len(n - order);
@@ -1825,7 +1825,7 @@ fn lpc_residual_scalar(
             for j in 0..ORDER {
                 sum += coeffs[j] as i64 * samples[i - 1 - j] as i64;
             }
-            res.push(samples[i] - (sum >> shift) as i32);
+            res.push(samples[i].wrapping_sub((sum >> shift) as i32));
         }
         res
     }
@@ -1899,7 +1899,7 @@ fn lpc_residual_scalar(
                 for j in 0..order {
                     sum += qlp[j] as i64 * samples[i - 1 - j] as i64;
                 }
-                res.push(samples[i] - (sum >> shift) as i32);
+                res.push(samples[i].wrapping_sub((sum >> shift) as i32));
             }
             res
         }
