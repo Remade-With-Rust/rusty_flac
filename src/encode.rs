@@ -1032,8 +1032,48 @@ unsafe fn rice_sums_avx2(res: &[i32]) -> [u64; RICE_KMAX + 1] {
 /// Best Rice parameter within `0..=kmax` (lowest k on ties) and its exact
 /// body bit cost, from precomputed shifted sums. The cost is convex in k
 /// (unary halves, suffix grows by cnt), so the scan stops at the first rise.
+///
+/// The scan starts at the bit length of the mean value, not at k = 0, and
+/// walks downhill: down while the step below costs no more (so ties settle
+/// on the lowest k), otherwise up while the step above costs less. On a
+/// convex cost that is the same answer as the ascending scan
+/// (`best_k_scan`, the test oracle), in two or three evaluations where the
+/// ascending scan took k + 1 -- the planner runs it on every partition of
+/// every level, twice.
 #[inline]
 fn best_k_from_sums(sums: &[u64], cnt: u64, kmax: usize) -> (u32, u64) {
+    let top = kmax.min(sums.len() - 1);
+    let cost = |k: usize| sums[k] + cnt * (1 + k as u64);
+    let mean = if cnt > 0 { sums[0] / cnt } else { 0 };
+    let mut k = ((u64::BITS - mean.leading_zeros()) as usize)
+        .saturating_sub(1)
+        .min(top);
+    let mut c = cost(k);
+    if k > 0 && cost(k - 1) <= c {
+        while k > 0 {
+            let d = cost(k - 1);
+            if d > c {
+                break;
+            }
+            k -= 1;
+            c = d;
+        }
+    } else {
+        while k < top {
+            let d = cost(k + 1);
+            if d >= c {
+                break;
+            }
+            k += 1;
+            c = d;
+        }
+    }
+    (k as u32, c)
+}
+
+/// The ascending scan [`best_k_from_sums`] replaced: first rise ends it.
+#[cfg(test)]
+fn best_k_scan(sums: &[u64], cnt: u64, kmax: usize) -> (u32, u64) {
     let mut best_k = 0u32;
     let mut best = sums[0] + cnt;
     for (k, &s) in sums.iter().enumerate().take(kmax + 1).skip(1) {
@@ -3460,6 +3500,44 @@ mod tests {
             }
         }
         assert!(overflowed, "test setup: no prediction left i32");
+    }
+
+    /// The warm-started search equals the ascending scan on real shifted
+    /// sums: every magnitude class, row widths cut short of `kmax`, both
+    /// method caps, empty and all-zero partitions.
+    #[test]
+    fn best_k_matches_ascending_scan() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for case in 0..4000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let cnt = [0usize, 1, 2, 7, 16, 32, 64, 4096][case % 8];
+            let bits = (x >> 58) as u32; // 0..=63 -> magnitude class
+            let res: Vec<i32> = (0..cnt)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    if bits % 9 == 0 {
+                        0
+                    } else {
+                        ((x >> 32) as i32) >> (31 - (bits % 26))
+                    }
+                })
+                .collect();
+            let mut full = [0u64; RICE_KMAX + 1];
+            rice_sums_scalar_into(&res, &mut full);
+            let width = 1 + (x as usize >> 3) % (RICE_KMAX + 1);
+            let row = &full[..width];
+            for kmax in [RICE_KMAX, RICE_KMAX_M0, 0, 3] {
+                assert_eq!(
+                    best_k_from_sums(row, cnt as u64, kmax),
+                    best_k_scan(row, cnt as u64, kmax),
+                    "case {case} kmax {kmax} width {width}"
+                );
+            }
+        }
     }
 
     #[test]
