@@ -1543,9 +1543,15 @@ unsafe fn lpc_residual_avx2<const CHECK: bool>(
     use core::arch::x86_64::*;
     let n = samples.len();
     let mut res: Vec<i32> = Vec::with_capacity(n - order);
-    let mut coeffs = [0.0f64; 32];
+    // Every slot `0..n - order` is written exactly once below, straight into
+    // the reserved buffer (one 16-byte store per four), and the length is set
+    // at the end. `extend_from_slice` per four paid a capacity check and a
+    // copy through a stack array each time. The coefficient broadcasts are
+    // made once, not once per tap per vector.
+    let out = res.as_mut_ptr();
+    let mut coeffs = [_mm256_setzero_pd(); 32];
     for j in 0..order {
-        coeffs[j] = qlp[j] as f64;
+        coeffs[j] = _mm256_set1_pd(qlp[j] as f64);
     }
     let scale = _mm256_set1_pd(math::exp2(-(shift as f64))); // 2^-shift, exact
     let hi = _mm256_set1_pd(i32::MAX as f64);
@@ -1556,7 +1562,7 @@ unsafe fn lpc_residual_avx2<const CHECK: bool>(
         let mut sum = _mm256_setzero_pd();
         for (j, &c) in coeffs[..order].iter().enumerate() {
             let x = _mm256_cvtepi32_pd(_mm_loadu_si128(p.add(i - 1 - j) as *const __m128i));
-            sum = _mm256_fmadd_pd(x, _mm256_set1_pd(c), sum);
+            sum = _mm256_fmadd_pd(x, c, sum);
         }
         // pred = floor(sum / 2^shift) == sum >> shift (arithmetic).
         let pred = _mm256_floor_pd(_mm256_mul_pd(sum, scale));
@@ -1574,17 +1580,14 @@ unsafe fn lpc_residual_avx2<const CHECK: bool>(
                 for (k, &c) in qlp[..order].iter().enumerate() {
                     sum += c as i64 * *p.add(j - 1 - k) as i64;
                 }
-                res.push(*p.add(j) - (sum >> shift) as i32);
+                *out.add(j - order) = *p.add(j) - (sum >> shift) as i32;
             }
             i += 4;
             continue;
         }
         let predi = _mm256_cvtpd_epi32(pred); // exact: integral and inside i32
         let s = _mm_loadu_si128(p.add(i) as *const __m128i);
-        let r = _mm_sub_epi32(s, predi);
-        let mut out4 = [0i32; 4];
-        _mm_storeu_si128(out4.as_mut_ptr() as *mut __m128i, r);
-        res.extend_from_slice(&out4);
+        _mm_storeu_si128(out.add(i - order) as *mut __m128i, _mm_sub_epi32(s, predi));
         i += 4;
     }
     for j in i..n {
@@ -1592,8 +1595,10 @@ unsafe fn lpc_residual_avx2<const CHECK: bool>(
         for (k, &c) in qlp[..order].iter().enumerate() {
             sum += c as i64 * *p.add(j - 1 - k) as i64;
         }
-        res.push(*p.add(j) - (sum >> shift) as i32);
+        *out.add(j - order) = *p.add(j) - (sum >> shift) as i32;
     }
+    // SAFETY: slots 0..n - order were each written above.
+    res.set_len(n - order);
     res
 }
 
