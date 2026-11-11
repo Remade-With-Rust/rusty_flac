@@ -1519,6 +1519,15 @@ fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize, peak: u3
             && std::arch::is_x86_feature_detected!("fma")
         {
             let sum_abs: i64 = qlp[..order].iter().map(|&c| (c as i64).abs()).sum();
+            // Integer lanes when every partial sum provably fits i32 (the
+            // bound the scalar 32-bit path uses, from the block's own peak):
+            // eight samples a vector and one multiply-add per tap, where the
+            // f64 path converts and fuses four at a time. 16-bit content
+            // almost always qualifies.
+            if (sum_abs as u64) << (u32::BITS - peak.leading_zeros()) < 1u64 << 31 {
+                // SAFETY: AVX2 checked above; the i32 bound just proven.
+                return unsafe { lpc_residual_avx2_i32(samples, qlp, shift, order) };
+            }
             // SAFETY: guarded by the runtime AVX2+FMA check.
             return unsafe {
                 if (sum_abs << 25) >> shift < (1i64 << 31) {
@@ -1530,6 +1539,55 @@ fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize, peak: u3
         }
     }
     lpc_residual_scalar(samples, qlp, shift, order, peak)
+}
+
+/// The LPC residual in eight i32 lanes, for blocks where
+/// `Σ|c| · 2^bits(peak) < 2^31` (checked by the caller): every partial sum is
+/// then exact in i32, so `mullo`/`add` equal the i64 arithmetic and the
+/// arithmetic shift is the decoder's `sum >> shift`.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2")]
+unsafe fn lpc_residual_avx2_i32(
+    samples: &[i32],
+    qlp: &[i32],
+    shift: i32,
+    order: usize,
+) -> Vec<i32> {
+    use core::arch::x86_64::*;
+    let n = samples.len();
+    let mut res: Vec<i32> = Vec::with_capacity(n - order);
+    let out = res.as_mut_ptr();
+    let mut coeffs = [_mm256_setzero_si256(); 32];
+    for j in 0..order {
+        coeffs[j] = _mm256_set1_epi32(qlp[j]);
+    }
+    let sh = _mm_cvtsi32_si128(shift);
+    let p = samples.as_ptr();
+    let mut i = order;
+    while i + 8 <= n {
+        let mut sum = _mm256_setzero_si256();
+        for (j, &c) in coeffs[..order].iter().enumerate() {
+            let x = _mm256_loadu_si256(p.add(i - 1 - j) as *const __m256i);
+            sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(x, c));
+        }
+        let pred = _mm256_sra_epi32(sum, sh);
+        let s = _mm256_loadu_si256(p.add(i) as *const __m256i);
+        _mm256_storeu_si256(
+            out.add(i - order) as *mut __m256i,
+            _mm256_sub_epi32(s, pred),
+        );
+        i += 8;
+    }
+    for j in i..n {
+        let mut sum: i32 = 0;
+        for (k, &c) in qlp[..order].iter().enumerate() {
+            sum += c * *p.add(j - 1 - k);
+        }
+        *out.add(j - order) = *p.add(j) - (sum >> shift);
+    }
+    // SAFETY: slots 0..n - order were each written above.
+    res.set_len(n - order);
+    res
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -3188,6 +3246,7 @@ mod tests {
             return;
         }
         let mut x = 23u64;
+        let mut i32_checked = 0usize;
         let samples: Vec<i32> = (0..5000)
             .map(|i| {
                 x = x.wrapping_mul(6364136223846793005).wrapping_add(13);
@@ -3204,6 +3263,12 @@ mod tests {
                 let b = unsafe { lpc_residual_avx2::<false>(&samples, &qlp, shift, order) };
                 let c = unsafe { lpc_residual_avx2::<true>(&samples, &qlp, shift, order) };
                 assert_eq!(a, c, "checked order={order} shift={shift}");
+                let sum_abs: u64 = qlp.iter().map(|&c| c.unsigned_abs() as u64).sum();
+                if sum_abs << (32 - peak.leading_zeros()) < 1u64 << 31 {
+                    let d = unsafe { lpc_residual_avx2_i32(&samples, &qlp, shift, order) };
+                    assert_eq!(a, d, "i32 order={order} shift={shift}");
+                    i32_checked += 1;
+                }
                 assert_eq!(a, b, "order={order} shift={shift}");
             }
         }
@@ -3222,6 +3287,26 @@ mod tests {
                 }
             })
             .collect();
+        // The i32-lane kernel on 16-bit-scale content, where its bound holds.
+        let small: Vec<i32> = samples.iter().map(|&v| v >> 7).collect();
+        let speak = small.iter().fold(0, |a: u32, &v| a | v.unsigned_abs());
+        for order in [1usize, 2, 3, 4, 7, 8, 12] {
+            let qlp: Vec<i32> = (0..order)
+                .map(|j| ((x >> (j * 3)) & 0x3FF) as i32 - 512)
+                .collect();
+            for shift in [0i32, 9, 12] {
+                let sum_abs: u64 = qlp.iter().map(|&c| c.unsigned_abs() as u64).sum();
+                assert!(
+                    sum_abs << (32 - speak.leading_zeros()) < 1u64 << 31,
+                    "test setup"
+                );
+                let a = lpc_residual_scalar(&small, &qlp, shift, order, speak);
+                let d = unsafe { lpc_residual_avx2_i32(&small, &qlp, shift, order) };
+                assert_eq!(a, d, "i32 order={order} shift={shift}");
+                i32_checked += 1;
+            }
+        }
+        assert!(i32_checked > 0);
         let mut overflowed = false;
         for order in [2usize, 7, 12] {
             let qlp: Vec<i32> = (0..order)
