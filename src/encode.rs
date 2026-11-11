@@ -983,30 +983,6 @@ fn best_k_from_sums(sums: &[u64], cnt: u64, kmax: usize) -> (u32, u64) {
     (best_k, best)
 }
 
-/// Rice-code one residual: quotient in unary, then the low `k` bits. The
-/// common case (short quotient) fuses unary + stop bit + low bits into one
-/// accumulator write.
-#[inline]
-fn write_rice(bw: &mut BitWriter, v: i32, k: u32) {
-    let u = zigzag(v);
-    let q = u >> k;
-    let total = q + 1 + k;
-    if total <= BitWriter::SHORT {
-        // The common case (k ~ 5-10, q ~ 0-3): the whole codeword and the
-        // writer's pending bits fit 32 bits.
-        bw.write_bits_short((1u32 << k) | (u & ((1u32 << k) - 1)), total);
-    } else if total <= 56 {
-        let low = (u as u64) & ((1u64 << k) - 1);
-        bw.write_bits((1u64 << k) | low, total);
-    } else {
-        bw.write_zeros(q);
-        bw.write_bits(1, 1);
-        if k > 0 {
-            bw.write_bits((u & ((1u32 << k) - 1)) as u64, k);
-        }
-    }
-}
-
 /// A residual coding plan: the coding method (0 = 4-bit Rice params, 1 =
 /// Rice2 5-bit params), the chosen partition order, per-partition parameters,
 /// and the residual-body bit cost (Σ param-field + Rice codes).
@@ -1168,9 +1144,7 @@ fn write_partitioned_residual(
         let cnt = if part == 0 { psize - p } else { psize };
         let k = plan.ks[part];
         bw.write_bits(k as u64, param_bits);
-        for &r in &res[idx..idx + cnt] {
-            write_rice(bw, r, k);
-        }
+        bw.write_rice_run(&res[idx..idx + cnt], k);
         idx += cnt;
     }
 }

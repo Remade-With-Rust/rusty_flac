@@ -55,25 +55,64 @@ impl BitWriter {
         }
     }
 
-    /// Longest field [`BitWriter::write_bits_short`] takes.
-    pub const SHORT: u32 = 24;
-
-    /// [`BitWriter::write_bits`] for `1 <= n <= 24`, in 32-bit arithmetic:
-    /// fewer than 8 bits are pending between calls, so they and the new field
-    /// fit a u32 — on a 32-bit core that is single-instruction shifts and ors
-    /// instead of 64-bit sequences. Only the pending low bits of `acc` are
-    /// ever read again, so keeping just its low word is exact.
-    #[inline]
-    pub fn write_bits_short(&mut self, val: u32, n: u32) {
-        debug_assert!((1..=Self::SHORT).contains(&n) && self.nbits < 8);
-        let acc = ((self.acc as u32) << n) | (val & ((1u32 << n) - 1));
-        let mut nbits = self.nbits + n;
-        while nbits >= 8 {
-            nbits -= 8;
-            self.buf.push((acc >> nbits) as u8);
+    /// Rice-code a run of residuals with one parameter `k` (one partition):
+    /// per value the unary quotient, the stop bit and the low `k` bits.
+    ///
+    /// The accumulator lives in locals for the whole run and drains 32 bits
+    /// at a time. Writing each codeword through its own write call stored
+    /// the accumulator back and pushed its whole bytes one at a time -- a
+    /// `Vec` push, with its capacity check, per byte of every codeword. A
+    /// codeword longer than 32 bits (a large escape quotient) leaves the
+    /// fast loop for the general path.
+    pub fn write_rice_run(&mut self, res: &[i32], k: u32) {
+        debug_assert!(k <= 30 && self.nbits < 8);
+        let mask = (1u32 << k) - 1;
+        let stop = 1u64 << k;
+        let mut acc = self.acc;
+        let mut nbits = self.nbits;
+        for &v in res {
+            let u = ((v << 1) ^ (v >> 31)) as u32;
+            let q = u >> k;
+            let total = q + 1 + k;
+            if total <= 32 {
+                // nbits < 32 before, so at most 63 pending bits: the 32 just
+                // above the newest `nbits` are the oldest, and they drain.
+                acc = (acc << total) | stop | (u & mask) as u64;
+                nbits += total;
+                if nbits >= 32 {
+                    nbits -= 32;
+                    self.buf
+                        .extend_from_slice(&((acc >> nbits) as u32).to_be_bytes());
+                }
+            } else {
+                self.acc = acc;
+                self.nbits = nbits;
+                self.drain();
+                if total <= 56 {
+                    self.write_bits(stop | (u & mask) as u64, total);
+                } else {
+                    self.write_zeros(q);
+                    self.write_bits(1, 1);
+                    if k > 0 {
+                        self.write_bits((u & mask) as u64, k);
+                    }
+                }
+                acc = self.acc;
+                nbits = self.nbits;
+            }
         }
-        self.acc = acc as u64;
+        self.acc = acc;
         self.nbits = nbits;
+        self.drain();
+    }
+
+    /// Push the accumulator's whole bytes, leaving fewer than 8 bits pending.
+    #[inline]
+    fn drain(&mut self) {
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            self.buf.push((self.acc >> self.nbits) as u8);
+        }
     }
 
     /// Write `val` as an `n`-bit two's-complement signed field. `n <= 56`.
@@ -365,29 +404,50 @@ impl<'a> BitReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    /// The 32-bit short path writes exactly the bits the 64-bit path does,
-    /// interleaved with long writes and at every pending-bit offset.
+    use super::*;
+
+    /// `write_rice_run` against codewords built one `write_bits` at a time:
+    /// every k, values across the 32-bit fast-path boundary and long escape
+    /// quotients, starting at every pending-bit offset.
     #[test]
-    fn write_bits_short_matches_write_bits() {
-        let mut x = 3u64;
-        let (mut a, mut b) = (BitWriter::new(), BitWriter::new());
-        for _ in 0..20_000 {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let n = ((x >> 59) as u32 % 24) + 1;
-            let v = (x >> 20) as u32;
-            if (x >> 7) & 3 == 0 {
-                let m = ((x >> 40) as u32 % 56) + 1;
-                a.write_bits(x >> 3, m);
-                b.write_bits(x >> 3, m);
-            } else {
-                a.write_bits(v as u64, n);
-                b.write_bits_short(v, n);
+    fn write_rice_run_matches_codewords() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for k in 0..=30u32 {
+            let vals: Vec<i32> = (0..300)
+                .map(|i| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let mag = match i % 7 {
+                        0 => (x >> 40) as i32 & 0x3ff_ffff, // long quotient at small k
+                        1 => 0,
+                        _ => ((x >> 20) as i32) >> (31 - k.min(29) - 1),
+                    };
+                    if x & 1 == 0 {
+                        mag
+                    } else {
+                        -mag
+                    }
+                })
+                .collect();
+            for lead in 0..8u32 {
+                let mut a = BitWriter::new();
+                let mut b = BitWriter::new();
+                a.write_bits(0b1011_0110, lead);
+                b.write_bits(0b1011_0110, lead);
+                a.write_rice_run(&vals, k);
+                for &v in &vals {
+                    let u = ((v << 1) ^ (v >> 31)) as u32;
+                    b.write_zeros(u >> k);
+                    b.write_bits(1, 1);
+                    if k > 0 {
+                        b.write_bits((u & ((1u32 << k) - 1)) as u64, k);
+                    }
+                }
+                assert_eq!(a.into_bytes(), b.into_bytes(), "k={k} lead={lead}");
             }
         }
-        assert_eq!(a.into_bytes(), b.into_bytes());
     }
-
-    use super::*;
 
     #[test]
     fn writer_matches_bit_by_bit_reference() {
