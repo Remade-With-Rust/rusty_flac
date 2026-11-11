@@ -1232,6 +1232,39 @@ fn autocorrelation(
     win: Window,
     scratch: &mut EncodeScratch,
 ) -> u32 {
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the runtime AVX2 check.
+            return unsafe { autocorrelation_avx2(samples, max_order, win, scratch) };
+        }
+    }
+    autocorrelation_body(samples, max_order, win, scratch)
+}
+
+/// [`autocorrelation`] compiled for AVX2: the windowing pass is three
+/// element-wise loops (peak fold, flat-middle widen-and-shift, tapered
+/// multiply) that the x86-64 baseline vectorizes with SSE2 only -- the middle
+/// copy was 15 instructions per four samples, where AVX2 sign-extends four
+/// lanes in one. Same body, same integers.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2")]
+unsafe fn autocorrelation_avx2(
+    samples: &[i32],
+    max_order: usize,
+    win: Window,
+    scratch: &mut EncodeScratch,
+) -> u32 {
+    autocorrelation_body(samples, max_order, win, scratch)
+}
+
+#[inline(always)]
+fn autocorrelation_body(
+    samples: &[i32],
+    max_order: usize,
+    win: Window,
+    scratch: &mut EncodeScratch,
+) -> u32 {
     // Windowed samples and the autocorrelation output are both encoder-owned
     // buffers, reused across every subframe analysis. Result in
     // `scratch.autoc`.
