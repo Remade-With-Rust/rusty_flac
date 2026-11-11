@@ -210,6 +210,18 @@ impl<'a> BitReader<'a> {
         Some(((v << shift) as i32) >> shift)
     }
 
+    /// Read an `n`-bit two's-complement signed value for `n` up to 64 (a
+    /// 32-bit stream's side channel is 33 bits wide).
+    pub fn read_signed_wide(&mut self, n: u32) -> Option<i64> {
+        if n <= 32 {
+            return self.read_signed(n).map(i64::from);
+        }
+        let hi = self.read_bits(n - 32)? as u64;
+        let lo = self.read_bits(32)? as u64;
+        let shift = 64 - n;
+        Some((((hi << 32) | lo) << shift) as i64 >> shift)
+    }
+
     /// Read a unary quantity: count of 0 bits before the terminating 1.
     #[inline]
     pub fn read_unary(&mut self) -> Option<u32> {

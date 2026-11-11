@@ -215,7 +215,8 @@ clip, in-house and reference-encoded):
 
 - Full subset: CONSTANT / VERBATIM / FIXED / LPC subframes, wasted bits, all
   four stereo assignments, Rice + Rice2 with escape codes, 4–32-bit sample
-  sizes, variable tail blocks.
+  sizes (including the 33-bit side channel of 32-bit stereo), variable tail
+  blocks.
 - **CRC-8 header and CRC-16 frame verification** on every frame (table-driven,
   so the check is nearly free); malformed input returns typed errors, never
   panics.

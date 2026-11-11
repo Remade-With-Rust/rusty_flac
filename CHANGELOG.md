@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(decode)* 32-bit stereo streams with a side channel (left/side, side/right,
+  mid/side, as `flac` writes them) no longer panic or decode to wrong samples:
+  the 33-bit side channel is decoded and undone in i64.
+
 ## [0.2.2](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.2.1...v0.2.2) - 2026-10-24
 
 ### Other
