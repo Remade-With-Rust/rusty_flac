@@ -785,6 +785,14 @@ fn rice_sums_into(res: &[i32], out: &mut [u64]) {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
+            // A row of at most 16 sums means every zigzagged value is below
+            // 2^16 (`rice_stride`), so a partition of fewer than 2^16 of them
+            // sums inside u32: eight lanes a vector, two vectors for k 0..15.
+            if out.len() <= 16 && res.len() < 1 << 16 {
+                // SAFETY: guarded by the runtime AVX2 check.
+                unsafe { rice_sums_avx2_u32(res, out) };
+                return;
+            }
             // SAFETY: guarded by the runtime AVX2 check.
             let all = unsafe { rice_sums_avx2(res) };
             out.copy_from_slice(&all[..out.len()]);
@@ -915,6 +923,33 @@ static RICE_ROWS: [RiceRow; 21] = [
 fn rice_stride(res: &[i32]) -> usize {
     let or = res.iter().fold(0u32, |a, &v| a | zigzag(v));
     ((32 - or.leading_zeros()) as usize).min(RICE_KMAX) + 1
+}
+
+/// [`rice_sums_avx2`] in u32 lanes, for rows of at most 16 sums: eight k per
+/// vector, so two shift-add pairs a sample where the u64 kernel needs four,
+/// and the row is written straight into `out` (no 31-entry stack row, no
+/// copy). The caller guarantees every value is below 2^16 and there are fewer
+/// than 2^16 of them, so no lane can overflow.
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[target_feature(enable = "avx2")]
+unsafe fn rice_sums_avx2_u32(res: &[i32], out: &mut [u64]) {
+    use core::arch::x86_64::*;
+    debug_assert!(out.len() <= 16 && res.iter().all(|&v| zigzag(v) < 1 << 16));
+    let sh0 = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let sh1 = _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15);
+    let mut a0 = _mm256_setzero_si256();
+    let mut a1 = _mm256_setzero_si256();
+    for &v in res {
+        let b = _mm256_set1_epi32(zigzag(v) as i32);
+        a0 = _mm256_add_epi32(a0, _mm256_srlv_epi32(b, sh0));
+        a1 = _mm256_add_epi32(a1, _mm256_srlv_epi32(b, sh1));
+    }
+    let mut lanes = [0u32; 16];
+    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, a0);
+    _mm256_storeu_si256(lanes.as_mut_ptr().add(8) as *mut __m256i, a1);
+    for (o, &l) in out.iter_mut().zip(&lanes) {
+        *o = l as u64;
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -3069,6 +3104,31 @@ mod tests {
             let mut scalar = [0u64; RICE_KMAX + 1];
             rice_sums_scalar_into(&res, &mut scalar);
             assert_eq!(scalar, unsafe { rice_sums_avx2(&res) }, "n={n}");
+        }
+        // The u32-lane kernel: values just under 2^16, up to 65535 of them
+        // (the largest sum its guard admits), every row width up to 16.
+        for n in [0usize, 1, 7, 32, 4096, 65535] {
+            let res: Vec<i32> = (0..n)
+                .map(|i| {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(7);
+                    let u = if i % 3 == 0 {
+                        0xffff
+                    } else {
+                        ((x >> 40) as u32) & 0xffff
+                    };
+                    // un-zigzag so zigzag(v) == u
+                    ((u >> 1) as i32) ^ -((u & 1) as i32)
+                })
+                .collect();
+            for width in 1..=16usize {
+                let mut scalar = vec![0u64; width];
+                let mut full = [0u64; RICE_KMAX + 1];
+                rice_sums_scalar_into(&res, &mut full);
+                scalar.copy_from_slice(&full[..width]);
+                let mut fast = vec![0u64; width];
+                unsafe { rice_sums_avx2_u32(&res, &mut fast) };
+                assert_eq!(scalar, fast, "u32 n={n} width={width}");
+            }
         }
     }
 
