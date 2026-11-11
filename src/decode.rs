@@ -795,7 +795,10 @@ fn restore_fixed(buf: &mut [i32], order: usize) {
 /// 5..=12 go to [`restore_lpc_avx2`].
 fn restore_lpc(buf: &mut [i32], qlp: &[i32], shift: u32) {
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
-    if (5..=12).contains(&qlp.len()) && std::arch::is_x86_feature_detected!("avx2") {
+    if (5..=12).contains(&qlp.len())
+        && std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("bmi2")
+    {
         // SAFETY: the CPU supports the feature the kernel was compiled for.
         return unsafe { restore_lpc_avx2(buf, qlp, shift) };
     }
@@ -819,7 +822,7 @@ fn restore_lpc(buf: &mut [i32], qlp: &[i32], shift: u32) {
 /// |sample| < 2^32, at most 12 taps), so the order of the adds cannot change
 /// the result; `restore_lpc_matches_reference` checks it bit for bit.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi2")]
 unsafe fn restore_lpc_avx2(buf: &mut [i32], qlp: &[i32], shift: u32) {
     use core::arch::x86_64::*;
     let order = qlp.len();
@@ -848,22 +851,43 @@ unsafe fn restore_lpc_avx2(buf: &mut [i32], qlp: &[i32], shift: u32) {
         buf[order - 3] as i64,
         buf[order - 4] as i64,
     );
-    for slot in &mut buf[order..] {
-        let p = _mm256_add_epi64(
-            _mm256_mul_epi32(win, ce),
-            _mm256_mul_epi32(_mm256_srli_epi64::<32>(win), co),
-        );
-        let t = _mm_add_epi64(_mm256_castsi256_si128(p), _mm256_extracti128_si256::<1>(p));
-        let old = _mm_cvtsi128_si64(_mm_add_epi64(t, _mm_unpackhi_epi64(t, t)));
-        let sum = old + c3 * h3 + c2 * h2 + c1 * h1 + c0 * h0;
-        let x = slot.wrapping_add((sum >> shift) as i32);
-        *slot = x;
-        // Next sample's window: lags shift by one, the lag-4 sample enters.
-        win = _mm256_blend_epi32::<1>(
-            _mm256_permutevar8x32_epi32(win, up),
-            _mm256_set1_epi32(h3 as i32),
-        );
-        (h3, h2, h1, h0) = (h2, h1, h0, x as i64);
+    // One sample: the window's taps, the four newest in registers, and the
+    // window advanced with the lag-4 sample `oldest`.
+    macro_rules! step {
+        ($slot:expr, $oldest:ident, $h2:ident, $h1:ident, $h0:ident) => {{
+            let p = _mm256_add_epi64(
+                _mm256_mul_epi32(win, ce),
+                _mm256_mul_epi32(_mm256_srli_epi64::<32>(win), co),
+            );
+            let t = _mm_add_epi64(_mm256_castsi256_si128(p), _mm256_extracti128_si256::<1>(p));
+            let old = _mm_cvtsi128_si64(_mm_add_epi64(t, _mm_unpackhi_epi64(t, t)));
+            let sum = old + c3 * $oldest + c2 * $h2 + c1 * $h1 + c0 * $h0;
+            let x = $slot.wrapping_add((sum >> shift) as i32);
+            *$slot = x;
+            win = _mm256_blend_epi32::<1>(
+                _mm256_permutevar8x32_epi32(win, up),
+                _mm256_set1_epi32($oldest as i32),
+            );
+            x as i64
+        }};
+    }
+    // Four samples per trip, the history's roles rotated in the source: the
+    // per-sample `(h3, h2, h1, h0) = (h2, h1, h0, x)` cost register moves
+    // (two-operand `imul` destroys a source), as did loading the shift count
+    // into `cl` (BMI2's `sarx` takes it from any register). The arithmetic
+    // and the recurrence's dependency chain are unchanged.
+    let mut chunks = buf[order..].chunks_exact_mut(4);
+    for q in &mut chunks {
+        let [s0, s1, s2, s3] = q else { unreachable!() };
+        let x0 = step!(s0, h3, h2, h1, h0);
+        let x1 = step!(s1, h2, h1, h0, x0);
+        let x2 = step!(s2, h1, h0, x0, x1);
+        let x3 = step!(s3, h0, x0, x1, x2);
+        (h3, h2, h1, h0) = (x0, x1, x2, x3);
+    }
+    for slot in chunks.into_remainder() {
+        let x = step!(slot, h3, h2, h1, h0);
+        (h3, h2, h1, h0) = (h2, h1, h0, x);
     }
 }
 
