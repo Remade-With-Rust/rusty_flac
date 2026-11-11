@@ -2124,8 +2124,9 @@ unsafe fn fixed_sums_avx2(samples: &[i32], bps: u32) -> [u64; 5] {
     let mut i = 4usize;
     while i + 8 <= n {
         let mut b = [_mm256_setzero_si256(); 5];
-        let mut cnt = 0usize;
-        while cnt < m && i + 8 <= n {
+        // A counted trip, not a two-condition test per vector: the bound
+        // check (`cnt < m && i + 8 <= n`) was a quarter of the loop body.
+        for _ in 0..m.min((n - i) / 8) {
             let s0 = _mm256_loadu_si256(p.add(i) as *const __m256i);
             let s1 = _mm256_loadu_si256(p.add(i - 1) as *const __m256i);
             let s2 = _mm256_loadu_si256(p.add(i - 2) as *const __m256i);
@@ -2145,7 +2146,6 @@ unsafe fn fixed_sums_avx2(samples: &[i32], bps: u32) -> [u64; 5] {
             b[3] = _mm256_add_epi32(b[3], _mm256_abs_epi32(r3));
             b[4] = _mm256_add_epi32(b[4], _mm256_abs_epi32(r4));
             i += 8;
-            cnt += 1;
         }
         widen(&mut a0, b[0]);
         widen(&mut a1, b[1]);
