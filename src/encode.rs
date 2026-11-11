@@ -993,10 +993,20 @@ struct ResidualPlan {
 }
 
 /// Largest usable partition order for a `bs`-sample block with predictor order
-/// `p`. Capped at 8 (256 partitions).
+/// `p`. Capped at [`MAX_PARTITION_ORDER`].
+/// Highest Rice partition order searched (64 partitions of a 4096 block),
+/// libFLAC's `-8` cap.
+///
+/// It was 8 (256 partitions of 16 samples). Orders 7 and 8 won 2 of 2,814
+/// subframes on a 96 kHz encode and moved the corpus total by 0.015%, while
+/// the planner paid for 256 finest partitions on every candidate: four times
+/// the shifted-sum kernel calls, each on 16 samples where its fixed cost
+/// dominates, and four times the rows to merge.
+const MAX_PARTITION_ORDER: u32 = 6;
+
 fn max_partition_order(bs: usize, p: usize) -> u32 {
     let mut po = 0u32;
-    while po < 8 {
+    while po < MAX_PARTITION_ORDER {
         let next = po + 1;
         if bs & ((1usize << next) - 1) != 0 {
             break; // bs not a multiple of 2^next
