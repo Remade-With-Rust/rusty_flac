@@ -381,7 +381,9 @@ impl<'a> BitReader<'a> {
     fn rice_run_fast(&mut self, k: u32, out: &mut [i32]) -> usize {
         let data = self.data;
         let (mut pos, mut buf, mut n) = (self.pos, self.bitbuf, self.nbits);
-        let low_mask = (1u32 << k) - 1;
+        // Two loop constants, not four: the masked form spilled its
+        // constants and reloaded three from the stack on every code.
+        let (kp1, top) = (k + 1, 63 - k);
         // For small k (16-bit material), refill only when a code with a
         // quotient of up to 12 might not fit: fewer and more regularly
         // spaced refills than "below 32 bits", so the branch mispredicts
@@ -402,17 +404,19 @@ impl<'a> BitReader<'a> {
                 n += take << 3;
             }
             let lead = buf.leading_zeros();
-            let len = lead + 1 + k;
+            let len = lead + kp1;
             if len > n {
                 break; // long quotient (or a zero window): general path
             }
-            // Bring the terminating 1 to bit 63; it and the k low bits are
-            // the top k+1 bits (k <= 30, so no shift reaches 64).
-            let low = ((buf << lead) >> (63 - k)) as u32 & low_mask;
+            // Bring the terminating 1 to bit 63: the top k+1 bits are then
+            // `t = 2^k | low`, so the value `(lead << k) | low` is
+            // `t + ((lead - 1) << k)` -- no mask (wrapping covers lead 0).
+            let t = ((buf << lead) >> top) as u32;
             buf <<= len; // len <= n <= 63
             n -= len;
-            let u = (lead << k) | low;
-            out[i] = ((u >> 1) as i32) ^ -((u & 1) as i32);
+            let u = t.wrapping_add(lead.wrapping_sub(1) << k);
+            // Un-zigzag: the low bit, smeared, flips the halved value.
+            out[i] = (((u << 31) as i32) >> 31) ^ (u >> 1) as i32;
             i += 1;
         }
         self.pos = pos;
