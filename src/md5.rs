@@ -49,11 +49,11 @@ impl Md5 {
                 self.buflen = 0;
             }
         }
-        while data.len() >= 64 {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&data[..64]);
-            self.process(&block);
-            data = &data[64..];
+        // Whole blocks straight from the caller's slice: copying each into a
+        // local first was a 64-byte move per block for nothing.
+        while let Some((block, rest)) = data.split_first_chunk::<64>() {
+            self.process(block);
+            data = rest;
         }
         if !data.is_empty() {
             self.buf[..data.len()].copy_from_slice(data);
@@ -110,13 +110,15 @@ impl Md5 {
         }
         macro_rules! round1 {
             ($a:ident, $b:ident, $c:ident, $d:ident, $i:expr, $s:expr) => {
-                step!(($b & $c) | (!$b & $d), $a, $b, $c, $d, $i, $i, $s);
+                // F = (b & c) | (!b & d), in the three-operation form.
+                step!($d ^ ($b & ($c ^ $d)), $a, $b, $c, $d, $i, $i, $s);
             };
         }
         macro_rules! round2 {
             ($a:ident, $b:ident, $c:ident, $d:ident, $i:expr, $s:expr) => {
+                // G = (d & b) | (!d & c), in the three-operation form.
                 step!(
-                    ($d & $b) | (!$d & $c),
+                    $c ^ ($d & ($b ^ $c)),
                     $a,
                     $b,
                     $c,
