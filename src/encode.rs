@@ -1447,19 +1447,29 @@ fn quantize_lpc(lpc: &[f64], precision: u32) -> Option<(Vec<i32>, i32)> {
 fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize, peak: u32) -> Vec<i32> {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
-        // Exactness guard: the vector path converts the prediction to i32
-        // with saturation, while the scalar/decoder truncate — identical only
-        // while |Σ|c|·2^25 >> shift| stays inside i32 (always true for sane
-        // predictors; degenerate quantizations fall back to scalar).
-        let sum_abs: i64 = qlp[..order].iter().map(|&c| (c as i64).abs()).sum();
-        let in_range = (sum_abs << 25) >> shift < (1i64 << 31);
-        if in_range
-            && samples.len() > order + 8
+        // Exactness: the vector path converts the prediction to i32 with
+        // `cvtpd_epi32`, which is exact only inside i32 (the scalar form and
+        // the decoder wrap). When the block bound `Σ|c|·2^25 >> shift < 2^31`
+        // proves every prediction is inside, the plain kernel runs. When it
+        // does not -- sharp predictors on high-rate audio fail it while their
+        // real predictions stay sample-sized -- the CHECKED kernel tests each
+        // vector of four and recomputes the rare one outside i32 the scalar
+        // way. Those blocks used to fall to the i64 scalar loop outright (11%
+        // of a 96 kHz encode). Two kernels rather than one checked one: the
+        // check measured +22 instructions a vector on blocks that need none.
+        if samples.len() > order + 8
             && std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("fma")
         {
+            let sum_abs: i64 = qlp[..order].iter().map(|&c| (c as i64).abs()).sum();
             // SAFETY: guarded by the runtime AVX2+FMA check.
-            return unsafe { lpc_residual_avx2(samples, qlp, shift, order) };
+            return unsafe {
+                if (sum_abs << 25) >> shift < (1i64 << 31) {
+                    lpc_residual_avx2::<false>(samples, qlp, shift, order)
+                } else {
+                    lpc_residual_avx2::<true>(samples, qlp, shift, order)
+                }
+            };
         }
     }
     lpc_residual_scalar(samples, qlp, shift, order, peak)
@@ -1467,7 +1477,12 @@ fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize, peak: u3
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn lpc_residual_avx2(samples: &[i32], qlp: &[i32], shift: i32, order: usize) -> Vec<i32> {
+unsafe fn lpc_residual_avx2<const CHECK: bool>(
+    samples: &[i32],
+    qlp: &[i32],
+    shift: i32,
+    order: usize,
+) -> Vec<i32> {
     use core::arch::x86_64::*;
     let n = samples.len();
     let mut res: Vec<i32> = Vec::with_capacity(n - order);
@@ -1476,6 +1491,8 @@ unsafe fn lpc_residual_avx2(samples: &[i32], qlp: &[i32], shift: i32, order: usi
         coeffs[j] = qlp[j] as f64;
     }
     let scale = _mm256_set1_pd(math::exp2(-(shift as f64))); // 2^-shift, exact
+    let hi = _mm256_set1_pd(i32::MAX as f64);
+    let lo = _mm256_set1_pd(i32::MIN as f64);
     let p = samples.as_ptr();
     let mut i = order;
     while i + 4 <= n {
@@ -1486,7 +1503,26 @@ unsafe fn lpc_residual_avx2(samples: &[i32], qlp: &[i32], shift: i32, order: usi
         }
         // pred = floor(sum / 2^shift) == sum >> shift (arithmetic).
         let pred = _mm256_floor_pd(_mm256_mul_pd(sum, scale));
-        let predi = _mm256_cvtpd_epi32(pred); // exact: pred is integral, |pred| < 2^31
+        // `cvtpd_epi32` is exact for an integral pred inside i32; outside it
+        // the scalar form wraps where the conversion would not, so those four
+        // go the scalar way (the decoder's arithmetic).
+        if CHECK
+            && _mm256_movemask_pd(_mm256_or_pd(
+                _mm256_cmp_pd::<_CMP_GT_OQ>(pred, hi),
+                _mm256_cmp_pd::<_CMP_LT_OQ>(pred, lo),
+            )) != 0
+        {
+            for j in i..i + 4 {
+                let mut sum: i64 = 0;
+                for (k, &c) in qlp[..order].iter().enumerate() {
+                    sum += c as i64 * *p.add(j - 1 - k) as i64;
+                }
+                res.push(*p.add(j) - (sum >> shift) as i32);
+            }
+            i += 4;
+            continue;
+        }
+        let predi = _mm256_cvtpd_epi32(pred); // exact: integral and inside i32
         let s = _mm_loadu_si128(p.add(i) as *const __m128i);
         let r = _mm_sub_epi32(s, predi);
         let mut out4 = [0i32; 4];
@@ -3076,15 +3112,48 @@ mod tests {
                 .map(|j| ((x >> (j * 3)) & 0xFFF) as i32 - 2048)
                 .collect();
             for shift in [11i32, 14] {
-                // Same exactness precondition the dispatcher enforces.
-                let sum_abs: i64 = qlp.iter().map(|&c| (c as i64).abs()).sum();
-                assert!((sum_abs << 25) >> shift < (1i64 << 31), "test setup");
                 let peak = samples.iter().fold(0, |a: u32, &s| a | s.unsigned_abs());
                 let a = lpc_residual_scalar(&samples, &qlp, shift, order, peak);
-                let b = unsafe { lpc_residual_avx2(&samples, &qlp, shift, order) };
+                let b = unsafe { lpc_residual_avx2::<false>(&samples, &qlp, shift, order) };
+                let c = unsafe { lpc_residual_avx2::<true>(&samples, &qlp, shift, order) };
+                assert_eq!(a, c, "checked order={order} shift={shift}");
                 assert_eq!(a, b, "order={order} shift={shift}");
             }
         }
+        // Predictions OUTSIDE i32: full-scale 25-bit samples (a 24-bit side
+        // channel) against large 15-bit coefficients and a small shift, so
+        // some vectors overflow i32 and take the per-vector scalar fallback
+        // (the scalar form wraps; the conversion would saturate).
+        let wide: Vec<i32> = (0..3000)
+            .map(|i| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(13);
+                let v = ((i as f64 * 0.013).sin() * 16_000_000.0) as i32;
+                if (x >> 33) & 7 == 0 {
+                    -v
+                } else {
+                    v
+                }
+            })
+            .collect();
+        let mut overflowed = false;
+        for order in [2usize, 7, 12] {
+            let qlp: Vec<i32> = (0..order)
+                .map(|j| if j % 2 == 0 { 16383 } else { -9000 })
+                .collect();
+            for shift in [0i32, 3, 9] {
+                let peak = wide.iter().fold(0, |a: u32, &s| a | s.unsigned_abs());
+                let a = lpc_residual_scalar(&wide, &qlp, shift, order, peak);
+                let b = unsafe { lpc_residual_avx2::<true>(&wide, &qlp, shift, order) };
+                assert_eq!(a, b, "wide order={order} shift={shift}");
+                overflowed |= (order..wide.len()).any(|i| {
+                    let s: i64 = (0..order)
+                        .map(|k| qlp[k] as i64 * wide[i - 1 - k] as i64)
+                        .sum();
+                    (s >> shift) != ((s >> shift) as i32) as i64
+                });
+            }
+        }
+        assert!(overflowed, "test setup: no prediction left i32");
     }
 
     #[test]
