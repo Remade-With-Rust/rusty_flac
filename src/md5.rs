@@ -49,11 +49,11 @@ impl Md5 {
                 self.buflen = 0;
             }
         }
-        while data.len() >= 64 {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(&data[..64]);
-            self.process(&block);
-            data = &data[64..];
+        // Whole blocks straight from the caller's slice: copying each into a
+        // local first was a 64-byte move per block for nothing.
+        while let Some((block, rest)) = data.split_first_chunk::<64>() {
+            self.process(block);
+            data = rest;
         }
         if !data.is_empty() {
             self.buf[..data.len()].copy_from_slice(data);

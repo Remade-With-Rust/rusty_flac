@@ -352,17 +352,22 @@ impl Encoder {
                     }
                 }
                 (2, 2) => {
+                    // One packed little-endian store per stereo frame (two
+                    // 2-byte copies before), which the compiler vectorizes.
                     let (l, r) = (&self.chans[0][i..end], &self.chans[1][i..end]);
-                    for (j, out) in buf.chunks_exact_mut(4).enumerate() {
-                        out[0..2].copy_from_slice(&(l[j] as i16).to_le_bytes());
-                        out[2..4].copy_from_slice(&(r[j] as i16).to_le_bytes());
+                    for ((out, &a), &b) in buf.chunks_exact_mut(4).zip(l).zip(r) {
+                        let w = (a as u16 as u32) | ((b as u16 as u32) << 16);
+                        out.copy_from_slice(&w.to_le_bytes());
                     }
                 }
                 (3, 2) => {
+                    // Both 24-bit samples of a frame packed into one 48-bit
+                    // value and written as six bytes in one copy.
                     let (l, r) = (&self.chans[0][i..end], &self.chans[1][i..end]);
-                    for (j, out) in buf.chunks_exact_mut(6).enumerate() {
-                        out[0..3].copy_from_slice(&l[j].to_le_bytes()[..3]);
-                        out[3..6].copy_from_slice(&r[j].to_le_bytes()[..3]);
+                    for ((out, &a), &b) in buf.chunks_exact_mut(6).zip(l).zip(r) {
+                        let w =
+                            (a as u32 & 0xff_ffff) as u64 | ((b as u32 & 0xff_ffff) as u64) << 24;
+                        out.copy_from_slice(&w.to_le_bytes()[..6]);
                     }
                 }
                 _ => {
