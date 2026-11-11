@@ -110,13 +110,15 @@ impl Md5 {
         }
         macro_rules! round1 {
             ($a:ident, $b:ident, $c:ident, $d:ident, $i:expr, $s:expr) => {
-                step!(($b & $c) | (!$b & $d), $a, $b, $c, $d, $i, $i, $s);
+                // F = (b & c) | (!b & d), in the three-operation form.
+                step!($d ^ ($b & ($c ^ $d)), $a, $b, $c, $d, $i, $i, $s);
             };
         }
         macro_rules! round2 {
             ($a:ident, $b:ident, $c:ident, $d:ident, $i:expr, $s:expr) => {
+                // G = (d & b) | (!d & c), in the three-operation form.
                 step!(
-                    ($d & $b) | (!$d & $c),
+                    $c ^ ($d & ($b ^ $c)),
                     $a,
                     $b,
                     $c,
