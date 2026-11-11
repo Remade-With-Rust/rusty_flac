@@ -1383,15 +1383,25 @@ fn autocorr_int_scalar(w: &[u64], out: &mut [i64]) {
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 #[target_feature(enable = "avx2")]
 unsafe fn autocorr_int_avx2(w: &[u64], out: &mut [i64]) {
+    // Lags in groups of up to eight: each group loads `x[i]` once for all of
+    // its lags, and eight accumulators plus the shared load fit the sixteen
+    // ymm registers. Groups of four split level 5's nine lags 4+4+1, the last
+    // group reloading every sample for one multiply-add; now 8+1, and level
+    // 8's thirteen 8+5 instead of 4+4+4+1.
     let mut lag0 = 0;
     while lag0 < out.len() {
-        match out.len() - lag0 {
+        let k = (out.len() - lag0).min(8);
+        match k {
             1 => lag_group::<1>(w, lag0, out),
             2 => lag_group::<2>(w, lag0, out),
             3 => lag_group::<3>(w, lag0, out),
-            _ => lag_group::<4>(w, lag0, out),
+            4 => lag_group::<4>(w, lag0, out),
+            5 => lag_group::<5>(w, lag0, out),
+            6 => lag_group::<6>(w, lag0, out),
+            7 => lag_group::<7>(w, lag0, out),
+            _ => lag_group::<8>(w, lag0, out),
         }
-        lag0 += (out.len() - lag0).min(4);
+        lag0 += k;
     }
 }
 
