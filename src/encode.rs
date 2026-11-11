@@ -491,17 +491,19 @@ impl Encoder {
         // Decide the channel layout: stereo picks the cheapest decorrelation
         // mode; mono / multichannel code each channel independently.
         //
-        // Mono/multichannel borrow each subframe's samples straight out of
-        // `self.chans` instead of copying them: the channel buffers are taken
-        // into `held_chans` for the duration of the frame (so the borrows are
-        // of a local, disjoint from `self.stats`/`self.scratch`) and restored
-        // after the frame is written. Stereo's mid and side are computed, so
-        // those subframes stay owned (`Cow::Owned`).
-        let mut held_chans: Vec<Vec<i32>> = Vec::new();
+        // Every subframe borrows its samples straight out of `self.chans`
+        // instead of copying them: the channel buffers are taken into
+        // `held_chans` for the duration of the frame (so the borrows are of a
+        // local, disjoint from `self.stats`/`self.scratch`) and restored after
+        // the frame is written. Stereo's mid and side are computed, so those
+        // subframes own their samples (`Cow::Owned`, moved, not copied).
+        let held_chans: Vec<Vec<i32>> = core::mem::take(&mut self.chans);
         let (assignment, subframes): (u64, Vec<Subframe<'_>>) = if self.channels == 2 {
+            // Borrowed from the held channels, so a chosen left or right arm
+            // is handed back as a borrow rather than a copy.
             let (assignment, subs) = decide_stereo(
-                &self.chans[0][start..start + bs],
-                &self.chans[1][start..start + bs],
+                &held_chans[0][start..start + bs],
+                &held_chans[1][start..start + bs],
                 bps,
                 self.max_lpc_order,
                 wins,
@@ -517,7 +519,6 @@ impl Encoder {
             (assignment, subs)
         } else {
             let max_lpc_order = self.max_lpc_order;
-            held_chans = core::mem::take(&mut self.chans);
             let chans = &held_chans;
             let stats = &mut self.stats;
             let scratch = &mut self.scratch;
@@ -559,11 +560,9 @@ impl Encoder {
         let fcrc = crc16(bw.bytes());
         bw.write_bits(fcrc as u64, 16);
         // The subframes (and their borrow of held_chans) are written; restore
-        // the channel buffers taken by the mono/multichannel path. The frame
-        // bytes stay in `bw` for the caller to copy out.
-        if !held_chans.is_empty() {
-            self.chans = held_chans;
-        }
+        // the channel buffers taken for the frame. The frame bytes stay in
+        // `bw` for the caller to copy out.
+        self.chans = held_chans;
     }
 }
 
@@ -2295,8 +2294,22 @@ impl<'a> ArmInput<'a> {
         }
     }
 
-    fn into_samples(self) -> Vec<i32> {
-        self.samples.into_owned()
+    /// [`ArmInput::prepare`] for computed samples the arm can own outright
+    /// (mid, side): with no wasted bits the vector moves in, no copy.
+    fn prepare_owned(samples: Vec<i32>, bps: u32) -> ArmInput<'a> {
+        let wasted = detect_wasted(&samples, bps);
+        if wasted == 0 {
+            return ArmInput {
+                samples: alloc::borrow::Cow::Owned(samples),
+                ebps: bps,
+                wasted: 0,
+            };
+        }
+        ArmInput {
+            samples: alloc::borrow::Cow::Owned(samples.iter().map(|&v| v >> wasted).collect()),
+            ebps: bps - wasted,
+            wasted,
+        }
     }
 
     /// Hand back the samples without materializing them: a borrow stays a
@@ -2565,23 +2578,27 @@ const STEREO_EST_MARGIN_PCT: u64 = 1;
 /// to estimate-competitive modes are REALIZED (residuals, exact Rice plans).
 /// The final mode decision uses exact realized costs.
 fn decide_stereo<'a>(
-    l: &[i32],
-    r: &[i32],
+    l: &'a [i32],
+    r: &'a [i32],
     bps: u32,
     max_lpc_order: usize,
     wins: &WindowCache,
     stats: &mut EncodeStats,
     scratch: &mut EncodeScratch,
 ) -> (u64, Vec<Subframe<'a>>) {
-    let side: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| a - b).collect();
-    let mid: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| (a + b) >> 1).collect();
+    // Mid and side in one pass, owned by their arms: a chosen one moves out
+    // as the subframe's samples instead of being copied out of a borrow.
+    let mut side: Vec<i32> = Vec::with_capacity(l.len());
+    let mut mid: Vec<i32> = Vec::with_capacity(l.len());
+    side.extend(l.iter().zip(r).map(|(&a, &b)| a - b));
+    mid.extend(l.iter().zip(r).map(|(&a, &b)| (a + b) >> 1));
 
     // Wasted-bits detection + shift per arm, then estimates for all four.
     let arms = [
         ArmInput::prepare(l, bps),
         ArmInput::prepare(r, bps),
-        ArmInput::prepare(&mid, bps),
-        ArmInput::prepare(&side, bps + 1),
+        ArmInput::prepare_owned(mid, bps),
+        ArmInput::prepare_owned(side, bps + 1),
     ];
     let mut ests = [
         estimate_arm(&arms[0], max_lpc_order, wins, stats, &mut *scratch),
@@ -2653,7 +2670,8 @@ fn decide_stereo<'a>(
         );
         let ebps = input.ebps;
         let choice = choices[arm].take().expect("chosen arm realized");
-        (Cow::Owned(input.into_samples()), ebps, choice)
+        // A borrow of the held channel stays a borrow; mid/side move out.
+        (input.into_cow(), ebps, choice)
     };
     let first = take_arm(a, &mut choices);
     let second = take_arm(b, &mut choices);
