@@ -23,8 +23,16 @@ use crate::math;
 /// Nominal samples-per-channel per FLAC frame. 4096 is FLAC's usual default and
 /// encodes as an explicit 16-bit block size (frame-header block-size code 7).
 const BLOCK_SIZE: usize = 4096;
-/// Quantized LPC coefficient precision in bits.
-const LPC_PRECISION: u32 = 14;
+/// Quantized LPC coefficient precision in bits: 15, the largest the format
+/// allows, as libFLAC uses for every depth above 16 bits.
+///
+/// It was 14. Sharp predictors (high-rate audio, whose top band is nearly
+/// empty, reach coefficients of 30-60) lose more to a coarser grid than the
+/// extra bit per coefficient costs: at level 8, 96 kHz/24 -3.2% and
+/// 384 kHz/24 -4.4%; 48 kHz/16 piano and speech also shrink (-0.45%,
+/// -0.13%), 44.1 kHz guitar grows 0.02%. On `flac -8` itself, 14 bits cost
+/// 4.4% on the same 96 kHz file.
+const LPC_PRECISION: u32 = 15;
 /// Highest LPC order searched — subset-compliant.
 pub(crate) const LPC_MAX_ORDER: usize = 12;
 /// Rice parameters searched. Method 0 (4-bit params) covers k 0..=14; method
@@ -1449,8 +1457,8 @@ fn quantize_lpc(lpc: &[f64], precision: u32) -> Option<(Vec<i32>, i32)> {
 /// decoder inverts, so it round-trips losslessly.
 ///
 /// The AVX2 path runs the dot products in f64 FMA lanes: with |sample| < 2^25
-/// and 14-bit-plus-sign coefficients every product is < 2^39 and every partial
-/// sum of ≤32 terms is < 2^44 — integers well inside f64's exact range, so
+/// and 15-bit (sign included) coefficients every product is < 2^39 and every
+/// partial sum of ≤32 terms is < 2^44 — integers well inside f64's exact range, so
 /// FMA ordering cannot change a bit, and `floor(sum · 2^-shift)` equals the
 /// arithmetic shift (gated by `lpc_residual_avx2_matches_scalar`).
 fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize, peak: u32) -> Vec<i32> {
