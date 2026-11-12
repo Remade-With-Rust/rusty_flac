@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.4.0...v0.5.0) - 2026-11-12
+
+### Other
+
+- Merge pull request #18 from alucryd/feat/block-size
+- satisfy clippy 1.100 needless_range_loop
+
 ### Added
 
 - `Encoder::set_block_size`: frame a stream at any block size FLAC allows
