@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.3.1...v0.4.0) - 2026-11-12
+
 ### Added
 
-- *(encode)* 32-bit encode (sample-size code 7): channels coded independently
+- *(encode)* 32-bit encode ([#21](https://github.com/Remade-With-Rust/rusty_flac/pull/21), by @benedictjohannes) (sample-size code 7): channels coded independently
   with CONSTANT, LPC (orders up to the level's cap, 15-bit coefficients),
   FIXED orders 0..=4 or VERBATIM. Predictions run in i64, and a candidate is
   used only when every residual fits 30 bits. LPC windows are Q30, and levels
