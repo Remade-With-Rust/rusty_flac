@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Encoder::set_block_size`: frame a stream at any block size FLAC allows
+  (16..=65535) instead of the fixed 4096, refusing others with the new
+  `EncodeError::BadBlockSize`. The default output is unchanged.
+
 ## [0.4.0](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.3.1...v0.4.0) - 2026-11-12
 
 ### Added
