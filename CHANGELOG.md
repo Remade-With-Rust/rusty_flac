@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.3.1...v0.3.2) - 2026-11-12
+
+### Added
+
+- *(encode)* 32-bit encode with LPC, Q30 windows and an exact predictor search
+
 ### Added
 
 - *(encode)* 32-bit encode (sample-size code 7): channels coded independently
