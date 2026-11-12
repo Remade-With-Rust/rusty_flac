@@ -1431,9 +1431,8 @@ fn write_partitioned_residual(
     let psize = bs >> plan.partition_order;
     let param_bits = 4 + plan.method;
     let mut idx = 0usize;
-    for part in 0..n_part {
+    for (part, &k) in plan.ks.iter().enumerate().take(n_part) {
         let cnt = if part == 0 { psize - p } else { psize };
-        let k = plan.ks[part];
         bw.write_bits(k as u64, param_bits);
         bw.write_rice_run(&res[idx..idx + cnt], k);
         idx += cnt;
@@ -2983,8 +2982,8 @@ fn wide_autocs(
     let set = wins.wide();
     let lags = max_order + 1;
     let mut out = Vec::with_capacity(2 + SEG_WINDOWS.len());
-    for k in 0..WINDOW_ALPHAS.len() {
-        autocorrelation(samples, max_order, set.full[k].view(), &mut *scratch);
+    for w in set.full.iter().take(WINDOW_ALPHAS.len()) {
+        autocorrelation(samples, max_order, w.view(), &mut *scratch);
         let mut a = [0.0f64; WIDE_MAX_ORDER + 1];
         a[..lags].copy_from_slice(&scratch.autoc[..lags]);
         out.push(a);
