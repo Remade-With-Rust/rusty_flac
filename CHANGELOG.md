@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(encode)* 32-bit encode (sample-size code 7): channels coded independently
+  with CONSTANT, LPC (orders up to the level's cap, 15-bit coefficients),
+  FIXED orders 0..=4 or VERBATIM. Predictions run in i64, and a candidate is
+  used only when every residual fits 30 bits. LPC windows are Q30, and levels
+  5 and 8 add libFLAC-style partial (and, at 8, punchout) Tukey windows; every
+  window's predictor at every order is ranked by the exact residual energy of
+  its quantized coefficients. On a 384 kHz / 32-bit track, level 8 is 28 %
+  smaller than FIXED-only coding, 7.6 % smaller than `flac -8 --no-mid-side`
+  and 3.4 % smaller than `flac -8` (which also uses stereo). 8/16/24-bit
+  output is unchanged.
+
 ## [0.3.1](https://github.com/Remade-With-Rust/rusty_flac/compare/v0.3.0...v0.3.1) - 2026-11-11
 
 ### Fixed
