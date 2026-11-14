@@ -170,6 +170,8 @@ What changed:
 - **The largest scratch buffers are shared** between analysis stages, and
   sized to the signal.
 - **Chunked streams can reuse one encoder** with `Encoder::finish_and_reset`.
+- **Long streams encode in constant memory** with `Encoder::take_frames`:
+  60 s of 48 kHz stereo peaks at the same 167 KB as 5 s (`tests/peak_heap.rs`).
 
 ## What is this?
 
@@ -316,6 +318,33 @@ assert_eq!(info.sample_rate, 44_100);
 assert_eq!(channels[0], left);
 assert_eq!(channels[1], right);
 ```
+
+Streaming encode, one frame at a time, in constant memory (a two-hour export
+never holds more than about one block of samples):
+
+```rust
+let mut enc = rusty_flac::Encoder::new(48_000, 2, 24).unwrap();
+let mut file = std::fs::File::create("out.flac")?;
+// STREAMINFO with the totals unknown; patched below once they are known.
+file.write_all(&enc.stream_info_placeholder().stream_header())?;
+for chunk in pcm_chunks {                       // interleaved i32, any length
+    enc.push_interleaved(chunk).unwrap();
+    for frame in enc.take_frames() {            // every complete block so far
+        file.write_all(&frame.data)?;           // frame.first_sample / .samples time it
+    }
+}
+let (last, info) = enc.finish_frames();         // the short final frame + STREAMINFO
+for frame in last {
+    file.write_all(&frame.data)?;
+}
+file.seek(SeekFrom::Start(8))?;                 // total samples, MD5, frame sizes
+file.write_all(&info.to_bytes())?;
+```
+
+The frames are byte-identical to what `finish()` writes for the same samples.
+For FLAC in a container, each `frame.data` is one packet and
+`info.metadata_block()` is the configuration: the payload of MP4's `dfLa`
+after its version and flags, and of Matroska's CodecPrivate after `fLaC`.
 
 Streaming decode, one frame at a time:
 
