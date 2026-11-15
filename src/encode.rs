@@ -8,8 +8,17 @@
 //! bottom-up sum-merged Rice partition planner (was a full 15-parameter scan
 //! per partition per order), and batched MD5 feeding (was per-sample rows).
 //!
-//! The encoder buffers the whole stream and emits a complete native FLAC
-//! stream from [`Encoder::finish`] — framing, STREAMINFO and MD5 included.
+//! Two ways to drive it:
+//!
+//! - **Whole stream:** push samples, then [`Encoder::finish`] returns a
+//!   complete native FLAC stream — framing, STREAMINFO and MD5 included.
+//! - **Streaming:** call [`Encoder::take_frames`] as samples arrive; it
+//!   encodes every complete block buffered so far, returns the frames, and
+//!   drops those samples, so memory stays at about one block per channel.
+//!   [`Encoder::finish_frames`] encodes the tail and returns the final
+//!   [`StreamInfo`] (total samples, MD5, frame sizes) to write or patch in.
+//!   Containers that carry FLAC (MP4 `dfLa`, Matroska CodecPrivate) take the
+//!   frames as packets and the STREAMINFO as configuration.
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
@@ -18,7 +27,9 @@ use alloc::vec::Vec;
 
 use crate::bitio::BitWriter;
 use crate::crc::{crc16, crc8};
+use crate::decode::StreamInfo;
 use crate::math;
+use crate::md5::Md5;
 
 /// Default samples-per-channel per FLAC frame, changed by
 /// [`Encoder::set_block_size`]. 4096 is FLAC's usual default; every size is
@@ -135,8 +146,41 @@ struct EncodeScratch {
     ks1: Vec<u32>,
 }
 
+/// One encoded FLAC frame, as [`Encoder::take_frames`] and
+/// [`Encoder::finish_frames`] return them: a complete frame (header,
+/// subframes, CRC-16), ready to write after the stream header or to hand to a
+/// container as one packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedFrame {
+    /// The frame bytes.
+    pub data: Vec<u8>,
+    /// Index of the frame's first sample (per channel) in the stream: its
+    /// timestamp in samples.
+    pub first_sample: u64,
+    /// Samples per channel in the frame (the block size; the last frame may
+    /// be shorter).
+    pub samples: u32,
+}
+
+/// What [`Encoder::take_frames`] has emitted so far.
+struct Streaming {
+    /// Block size of every frame emitted (fixed once the first is out: FLAC's
+    /// fixed-blocksize stream cannot change it mid-stream).
+    block_size: usize,
+    frame_number: u64,
+    /// Samples per channel already emitted.
+    samples: u64,
+    /// MD5 of the emitted samples, in STREAMINFO's byte layout.
+    md5: Md5,
+    min_frame: u32,
+    max_frame: u32,
+    /// Frame writer, reused across calls.
+    bw: BitWriter,
+}
+
 /// A pure-Rust FLAC encoder. Feed planar or interleaved `i32` samples at the
-/// configured bit depth, then [`Encoder::finish`] returns the complete stream.
+/// configured bit depth, then [`Encoder::finish`] returns the complete stream
+/// — or stream it with [`Encoder::take_frames`] / [`Encoder::finish_frames`].
 pub struct Encoder {
     sample_rate: u32,
     channels: usize,
@@ -149,6 +193,8 @@ pub struct Encoder {
     /// LPC windows for the last block size seen; kept across streams by
     /// [`Encoder::finish_and_reset`].
     wins: WindowCache,
+    /// Set by the first [`Encoder::take_frames`].
+    streaming: Option<Box<Streaming>>,
 }
 
 impl Encoder {
@@ -175,6 +221,7 @@ impl Encoder {
             stats: EncodeStats::default(),
             scratch: EncodeScratch::default(),
             wins: WindowCache::default(),
+            streaming: None,
         })
     }
 
@@ -196,7 +243,9 @@ impl Encoder {
     }
 
     /// Samples per channel in every frame but the last, `16..=65535`
-    /// (default 4096). Sizes above 4608 leave FLAC's streamable subset (above
+    /// (default 4096). Once [`Encoder::take_frames`] has emitted a frame the
+    /// stream's block size is fixed, and a later call only affects the next
+    /// stream (after [`Encoder::finish_and_reset`]). Sizes above 4608 leave FLAC's streamable subset (above
     /// 16384 for sample rates over 48 kHz). Only 4096 reads its LPC windows
     /// from a static table; any other size builds them (16/24-bit and 32-bit
     /// alike) once and keeps them, across streams too with
@@ -214,6 +263,11 @@ impl Encoder {
         let ch = self.channels;
         if samples.len() % ch != 0 {
             return Err(EncodeError::RaggedInput);
+        }
+        // Nothing to add. (The multichannel loop below indexed `samples[c..]`,
+        // which panicked on an empty slice for channels past the first.)
+        if samples.is_empty() {
+            return Ok(());
         }
         if ch == 1 {
             self.chans[0].extend_from_slice(samples);
@@ -343,8 +397,145 @@ impl Encoder {
     }
 
     /// Encode all buffered samples into a complete native FLAC stream.
+    ///
+    /// After [`Encoder::take_frames`] this returns the stream header (with the
+    /// final STREAMINFO) followed by the frames not yet taken; the frames
+    /// already taken sit between the two. Streaming callers usually want
+    /// [`Encoder::finish_frames`] instead.
     pub fn finish(mut self) -> Vec<u8> {
         self.encode_stream()
+    }
+
+    /// STREAMINFO as it stands before encoding: the format and nominal block
+    /// size, with the totals unknown (total samples 0, MD5 zero, frame sizes
+    /// 0), which the format allows. A streaming writer puts
+    /// [`StreamInfo::stream_header`] of this in front of the first frame, and
+    /// when it can seek, overwrites the 34 bytes at offset 8 with
+    /// [`StreamInfo::to_bytes`] of [`Encoder::finish_frames`]'s final one —
+    /// what libFLAC does.
+    pub fn stream_info_placeholder(&self) -> StreamInfo {
+        let bs = self
+            .streaming
+            .as_ref()
+            .map_or(self.block_size, |s| s.block_size) as u32;
+        StreamInfo {
+            min_block_size: bs,
+            max_block_size: bs,
+            min_frame_size: 0,
+            max_frame_size: 0,
+            sample_rate: self.sample_rate,
+            channels: self.channels as u32,
+            bits_per_sample: self.bps,
+            total_samples: 0,
+            md5: [0; 16],
+        }
+    }
+
+    /// Streaming: encode every complete block buffered so far and return the
+    /// frames, in order. The samples they cover are dropped from the buffer
+    /// (and folded into the running MD5), so a caller that pushes and takes
+    /// in turn holds about one block per channel, however long the stream.
+    /// Fewer than one block buffered returns nothing; the remainder waits for
+    /// more samples or for [`Encoder::finish_frames`].
+    ///
+    /// The frames are byte-identical to the ones [`Encoder::finish`] would
+    /// have written for the same samples.
+    pub fn take_frames(&mut self) -> Vec<EncodedFrame> {
+        let n = self.chans.first().map_or(0, |c| c.len());
+        let bs = self.stream_state().block_size;
+        let full = n / bs * bs;
+        self.encode_range(full, bs)
+    }
+
+    /// Streaming: encode what is still buffered (the final, possibly short,
+    /// frame) and return those frames with the final STREAMINFO — total
+    /// samples, MD5 and the smallest and largest frame across the whole
+    /// stream. Write it with [`StreamInfo::stream_header`] (or patch it in at
+    /// offset 8), or hand it to a container: [`StreamInfo::metadata_block`]
+    /// is the `dfLa` / CodecPrivate block.
+    pub fn finish_frames(mut self) -> (Vec<EncodedFrame>, StreamInfo) {
+        self.finish_streaming()
+    }
+
+    /// Encode the rest, close the streaming state, return the last frames
+    /// and the final STREAMINFO.
+    fn finish_streaming(&mut self) -> (Vec<EncodedFrame>, StreamInfo) {
+        let n = self.chans.first().map_or(0, |c| c.len());
+        let bs = self.stream_state().block_size;
+        let frames = self.encode_range(n, bs);
+        let st = self.streaming.take().expect("stream_state set it");
+        let (min_frame, max_frame) = if st.frame_number == 0 {
+            (0, 0)
+        } else {
+            (st.min_frame, st.max_frame)
+        };
+        let info = StreamInfo {
+            min_block_size: bs as u32,
+            max_block_size: bs as u32,
+            min_frame_size: min_frame,
+            max_frame_size: max_frame,
+            sample_rate: self.sample_rate,
+            channels: self.channels as u32,
+            bits_per_sample: self.bps,
+            total_samples: st.samples,
+            md5: st.md5.finalize(),
+        };
+        (frames, info)
+    }
+
+    /// The streaming state, created (and the block size fixed) on first use.
+    fn stream_state(&mut self) -> &mut Streaming {
+        let (bs, ch, bytes) = (self.block_size, self.channels, (self.bps / 8) as usize);
+        self.streaming.get_or_insert_with(|| {
+            Box::new(Streaming {
+                block_size: bs,
+                frame_number: 0,
+                samples: 0,
+                md5: Md5::new(),
+                min_frame: u32::MAX,
+                max_frame: 0,
+                bw: BitWriter::with_capacity(bs * ch * bytes + 64),
+            })
+        })
+    }
+
+    /// Encode the first `end` buffered samples as frames of `bs` (the last
+    /// one shorter when `end` is not a multiple), fold them into the MD5 and
+    /// drop them from the buffer.
+    fn encode_range(&mut self, end: usize, bs: usize) -> Vec<EncodedFrame> {
+        if end == 0 {
+            return Vec::new();
+        }
+        let bps = self.bps;
+        let mut st = self.streaming.take().expect("stream_state set it");
+        let mut wins = core::mem::take(&mut self.wins);
+        wins.wide = bps > 24;
+        let mut frames = Vec::with_capacity(end.div_ceil(bs));
+        let mut start = 0usize;
+        while start < end {
+            let len = (end - start).min(bs);
+            wins.ensure(len, bs);
+            self.encode_frame(st.frame_number, start, len, bps, &wins, &mut st.bw);
+            let data = st.bw.bytes().to_vec();
+            st.min_frame = st.min_frame.min(data.len() as u32);
+            st.max_frame = st.max_frame.max(data.len() as u32);
+            frames.push(EncodedFrame {
+                data,
+                first_sample: st.samples + start as u64,
+                samples: len as u32,
+            });
+            st.frame_number += 1;
+            self.stats.frames += 1;
+            start += len;
+        }
+        self.wins = wins;
+        self.feed_md5(&mut st.md5, 0, end);
+        st.samples += end as u64;
+        for chan in &mut self.chans {
+            chan.drain(..end);
+        }
+        self.streaming = Some(st);
+        frames
     }
 
     /// Like [`Encoder::finish`], but also returns the wiring-audit counters.
@@ -369,24 +560,32 @@ impl Encoder {
             chan.clear();
         }
         self.stats = EncodeStats::default();
+        self.streaming = None;
         out
     }
 
     /// MD5 of the unencoded audio: interleaved samples, little-endian, at the
     /// coded bit depth — FLAC's STREAMINFO integrity signature.
     fn compute_md5(&self) -> [u8; 16] {
-        let bytes_per = (self.bps / 8) as usize;
+        let mut md5 = Md5::new();
         let n = self.chans.first().map_or(0, |c| c.len());
+        self.feed_md5(&mut md5, 0, n);
+        md5.finalize()
+    }
+
+    /// Feed buffered samples `from..to` into `md5` in STREAMINFO's layout.
+    fn feed_md5(&self, md5: &mut Md5, from: usize, to: usize) {
+        let bytes_per = (self.bps / 8) as usize;
+        let n = to;
         let ch = self.channels;
-        let mut md5 = crate::md5::Md5::new();
         // Batch: build interleaved LE rows for a run of frames, hash per chunk.
         const CHUNK_FRAMES: usize = 16 * 1024;
         // Reserve for the first (often only) chunk, not the full CHUNK_FRAMES:
         // a short block used a 32 KiB transient here where 1 KiB sufficed —
         // material on a small no_std heap. resize() still grows it for a long
         // stream, so the per-chunk hashing is unchanged.
-        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_FRAMES.min(n) * ch * bytes_per);
-        let mut i = 0usize;
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_FRAMES.min(n - from) * ch * bytes_per);
+        let mut i = from;
         while i < n {
             let end = (i + CHUNK_FRAMES).min(n);
             buf.resize((end - i) * ch * bytes_per, 0);
@@ -430,10 +629,12 @@ impl Encoder {
             md5.update(&buf);
             i = end;
         }
-        md5.finalize()
     }
 
     fn encode_stream(&mut self) -> Vec<u8> {
+        if self.streaming.is_some() {
+            return self.encode_stream_after_take();
+        }
         // RUSTY_FLAC_TIMING=1: print coarse stage shares to stderr (wiring
         // audit / campaign tool; zero cost when unset).
         #[cfg(feature = "std")]
@@ -515,6 +716,17 @@ impl Encoder {
         stream.extend_from_slice(&si);
         stream.extend_from_slice(&frames);
         stream
+    }
+
+    /// [`Encoder::finish`] after [`Encoder::take_frames`]: the final stream
+    /// header, then the frames not yet taken.
+    fn encode_stream_after_take(&mut self) -> Vec<u8> {
+        let (frames, info) = self.finish_streaming();
+        let mut out = info.stream_header();
+        for f in frames {
+            out.extend_from_slice(&f.data);
+        }
+        out
     }
 
     fn encode_frame(

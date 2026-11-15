@@ -80,6 +80,47 @@ pub struct FrameDecoder {
 }
 
 impl StreamInfo {
+    /// The 34-byte STREAMINFO body, as the format lays it out.
+    pub fn to_bytes(&self) -> [u8; 34] {
+        let mut b = [0u8; 34];
+        let put = |b: &mut [u8; 34], at: usize, v: u64, bytes: usize| {
+            for k in 0..bytes {
+                b[at + k] = (v >> (8 * (bytes - 1 - k))) as u8;
+            }
+        };
+        put(&mut b, 0, u64::from(self.min_block_size), 2);
+        put(&mut b, 2, u64::from(self.max_block_size), 2);
+        put(&mut b, 4, u64::from(self.min_frame_size), 3);
+        put(&mut b, 7, u64::from(self.max_frame_size), 3);
+        // rate(20) channels-1(3) bps-1(5) total(36) = 64 bits
+        let packed = (u64::from(self.sample_rate) & 0xF_FFFF) << 44
+            | (u64::from(self.channels.saturating_sub(1)) & 7) << 41
+            | (u64::from(self.bits_per_sample.saturating_sub(1)) & 31) << 36
+            | (self.total_samples & 0xF_FFFF_FFFF);
+        put(&mut b, 10, packed, 8);
+        b[18..].copy_from_slice(&self.md5);
+        b
+    }
+
+    /// STREAMINFO as a metadata block (marked last, type 0, length 34): the
+    /// bytes MP4's `dfLa` box carries after its version and flags, and
+    /// Matroska's CodecPrivate after `fLaC`.
+    pub fn metadata_block(&self) -> [u8; 38] {
+        let mut b = [0u8; 38];
+        b[..4].copy_from_slice(&[0x80, 0, 0, 34]);
+        b[4..].copy_from_slice(&self.to_bytes());
+        b
+    }
+
+    /// A native FLAC stream header: `fLaC` + [`Self::metadata_block`]. The
+    /// STREAMINFO body starts at offset 8.
+    pub fn stream_header(&self) -> Vec<u8> {
+        let mut h = Vec::with_capacity(42);
+        h.extend_from_slice(b"fLaC");
+        h.extend_from_slice(&self.metadata_block());
+        h
+    }
+
     /// Parse a STREAMINFO metadata block body (its 34 bytes, without the
     /// 4-byte block header). Longer input is fine; shorter is
     /// [`DecodeError::Truncated`].

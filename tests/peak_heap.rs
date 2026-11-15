@@ -221,8 +221,49 @@ const CEILINGS: &[(&str, usize, u32, usize)] = &[
     ("noise", 8192, 8, 140_288),
 ];
 
+/// The peak counter is process-wide: the measuring tests take turns.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Peak heap of a streamed encode (`take_frames` after every 4096-frame push,
+/// frames dropped as a writer would after writing them), 48 kHz stereo s16.
+fn streaming_peak(seconds: usize) -> usize {
+    let block = content("noise", 4096 * 2, 13); // 4096 stereo frames
+    let base = CUR.load(Ordering::Relaxed);
+    PEAK.store(base, Ordering::Relaxed);
+    MEASURING.with(|m| m.set(true));
+    let mut enc = rusty_flac::Encoder::new(48_000, 2, 16).unwrap();
+    let mut bytes = 0usize;
+    for _ in 0..seconds * 48_000 / 4096 {
+        enc.push_s16le_bytes(&block).unwrap();
+        for f in enc.take_frames() {
+            bytes += f.data.len();
+        }
+    }
+    let (tail, info) = enc.finish_frames();
+    bytes += tail.iter().map(|f| f.data.len()).sum::<usize>();
+    MEASURING.with(|m| m.set(false));
+    assert!(bytes > 0 && info.total_samples > 0);
+    (PEAK.load(Ordering::Relaxed) - base) as usize
+}
+
+#[test]
+fn streaming_peak_does_not_grow_with_the_stream() {
+    let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Whole-stream encoding holds every sample (a two-hour 48 kHz stereo
+    // export is ~2.8 GB of i32); streaming holds about one block.
+    let short = streaming_peak(5);
+    let long = streaming_peak(60);
+    println!("streaming peak: 5 s {short} B, 60 s {long} B");
+    assert!(
+        long <= short + 4096,
+        "peak grew with length: {short} -> {long}"
+    );
+    assert!(long < 512 * 1024, "streaming peak {long} B");
+}
+
 #[test]
 fn encoder_peak_heap_per_stream() {
+    let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut failed = Vec::new();
     println!("content samples level peak_bytes flac_bytes");
     for &(class, n, level, ceiling) in CEILINGS {

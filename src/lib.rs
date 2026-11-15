@@ -4,7 +4,9 @@
 //! A self-contained FLAC **encoder + decoder**: no FFI, no required dependencies.
 //!
 //! - [`Encoder`]: feed planar or interleaved `i32` samples (8/16/24/32-bit, up
-//!   to 8 channels), get a complete spec-valid FLAC stream with STREAMINFO MD5.
+//!   to 8 channels), get a complete spec-valid FLAC stream with STREAMINFO MD5
+//!   — or stream it frame by frame ([`Encoder::take_frames`]) in constant
+//!   memory, with the final [`StreamInfo`] at the end.
 //! - [`Decoder`]: streaming per-frame decode of a FLAC stream to planar `i32`,
 //!   with CRC verification; [`decode`] is the whole-stream convenience.
 //!
@@ -39,7 +41,7 @@ mod prof;
 mod window_table;
 
 pub use decode::{decode, DecodeError, Decoder, FrameDecoder, Sample, StreamInfo};
-pub use encode::{EncodeError, EncodeStats, Encoder};
+pub use encode::{EncodeError, EncodeStats, EncodedFrame, Encoder};
 
 /// Decode stage profiler (the `profile` feature; measurement only).
 #[cfg(feature = "profile")]
